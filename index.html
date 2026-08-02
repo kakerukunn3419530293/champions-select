@@ -1089,6 +1089,36 @@ function endTurn(m, other, field, rng) {
 }
 
 /* ---------------- 行動選択AI ---------------- */
+// 相手の技 mv を今のフォルムで受けたときの最大ダメージ（連続技は合計）
+function incomingMax(foe, m, field, mv) {
+  const r = E.damageRolls(foe, m, mv, field, false);
+  const sp = sp_(mv.name);
+  if (sp.triple) return Math.max.apply(null, r) * 6;
+  const n = (sp.multihit && foe.ability === "スキルリンク") ? 5 : (sp.hits || (sp.multihit ? 3.2 : 1));
+  return Math.max.apply(null, r) * n;
+}
+// 技 mv を出すとき自分が先に動けるか（優先度→素早さ。同速は先手扱いにしない）
+function movesFirst(m, foe, field, mv) {
+  const [fmv] = bestDamageMove(foe, m, field, true);
+  const pm = mv.priority + ((m.ability === "いたずらごころ" && mv.cat === "status") ? 1 : 0);
+  const pf = fmv ? fmv.priority : 0;
+  if (pm !== pf) return pm > pf;
+  let sm = m.speed(field), sf = foe.speed(field);
+  if (field.trickroom) { sm = -sm; sf = -sf; }
+  return sm > sf;
+}
+// ブレードのままだと落ちるが、シールドに戻れば耐える場面か
+function kingsShieldSaves(m, foe, field) {
+  const [fmv] = bestDamageMove(foe, m, field, true);
+  if (!fmv) return false;
+  if (incomingMax(foe, m, field, fmv) < m.hp) return false;   // そもそも耐える
+  const s0 = m.stance;
+  m.setStance("shield");
+  const shield = incomingMax(foe, m, field, fmv);
+  m.setStance(s0);
+  return shield < m.hp;
+}
+
 function bestDamageMove(atk, dfn, field, first) {
   let best = null, bd = -1;
   for (const mv of atk.moves) {
@@ -1135,10 +1165,21 @@ function chooseMove(m, foe, field, rng) {
   }
   m.setStance(stance0);
   let kills = dmgMoves.filter(x => x.mn >= foe.hp && x.acc >= 0.99);
+  let sureKill = null;
   if (kills.length) {
     kills.sort((a, b) => (b.pri - a.pri) || (b.av - a.av));
-    return kills[0].mv;
+    sureKill = kills[0].mv;
+    // 先に動けるなら倒し切る。後攻なら落とされてからでは撃てないので、
+    // バトルスイッチの判断（下）に譲る
+    if (m.ability !== "バトルスイッチ" || movesFirst(m, foe, field, sureKill)) return sureKill;
   }
+  // バトルスイッチ: ブレードのままだと落ちるがシールドなら耐える場面では
+  // キングシールドでフォルムを戻す
+  if (m.ability === "バトルスイッチ" && m.stance === "blade" && m.protectStreak === 0
+      && kingsShieldSaves(m, foe, field)) {
+    for (const mv of m.moves) if (mv.name === "キングシールド") return mv;
+  }
+  if (sureKill) return sureKill;
   kills = dmgMoves.filter(x => x.mx >= foe.hp);
   if (kills.length) {
     kills.sort((a, b) => (b.pri - a.pri) || (b.av * b.acc - a.av * a.acc));
