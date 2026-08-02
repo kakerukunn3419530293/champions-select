@@ -116,12 +116,15 @@ details summary{font-size:13px;cursor:pointer;color:var(--accent);padding:4px 0}
       <button onclick="clearParty()">クリア</button>
       <button onclick="loadDefault()">推奨パーティに戻す</button>
       <button id="power" onclick="measure()">パーティの強さを測定</button>
+      <button id="sug" onclick="suggest()">パーティの改善案</button>
     </div>
-    <p class="hint">「強さを測定」は上位100体すべてと戦わせます（スマホで1〜2分）。</p>
+    <p class="hint">「強さを測定」は上位100体すべてと戦わせます（スマホで1〜2分）。
+    「改善案」は1体入れ替えたときに対応力がどう変わるかを探します（さらに1〜2分）。</p>
   </details>
 
   <p class="msg" id="msg"></p>
   <div id="power_out"></div>
+  <div id="sug_out"></div>
   <div id="out"></div>
 
   <details class="card">
@@ -248,7 +251,25 @@ class Mon {
     this.stats = realStats(build.base, build.points, build.nature);
     this.maxHp = this.stats.hp;
     this.moves = build.moves.filter(m => MOVES[m]).map(m => MOVES[m]);
+    // バトルスイッチ（ギルガルド）。攻撃技を出すとブレード、キングシールドでシールドに戻る。
+    // ブレードは種族値のA↔B・C↔Dが入れ替わった形（フォルムデータで確認済み）。
+    // HP種族値は両フォルム同じなので最大HPは変わらない。
+    this.stanceStats = null;
+    if (this.ability === "バトルスイッチ") {
+      const b = build.base;
+      const blade = Object.assign({}, b, {
+        attack: b.defense, defense: b.attack,
+        sp_attack: b.sp_defense, sp_defense: b.sp_attack});
+      this.stanceStats = {shield: this.stats,
+                          blade: realStats(blade, build.points, build.nature)};
+    }
     this.reset();
+  }
+  setStance(s) {
+    if (this.stanceStats && this.stance !== s) {
+      this.stance = s;
+      this.stats = this.stanceStats[s];
+    }
   }
   reset() {
     this.hp = this.maxHp;
@@ -261,6 +282,9 @@ class Mon {
     this.locked = null; this.charging = null; this.recharge = false;
     this.destiny = false; this.perish = 0; this.rage = 0; this.lastDmg = 0;
     this.wish = 0; this.transformed = false; this.taunt = 0;
+    this.proteanUsed = false;   // へんげんじざい/リベロ（登場ごとに1回だけ）
+    this.stance = "shield";     // バトルスイッチ（登場時はシールドフォルム）
+    if (this.stanceStats) this.stats = this.stanceStats.shield;
     this.reflect = 0; this.lightscreen = 0; this.veil = 0; this.tailwind = 0;
     this.protecting = false; this.protectKind = "normal"; this.choiceLock = null; this.curse = false;
   }
@@ -395,6 +419,9 @@ function offenseMods(atk, mv, dfn, field) {
 /* ---------------- ダメージ ---------------- */
 const HP_DEP = ["しおふき", "じたばた", "ふんどのこぶし", "がむしゃら", "いのちがけ",
                 "つけあがる", "アシストパワー", "おはかまいり"];
+/* ダメージ計算のメモ化。多数の型を総当たりすると際限なく増えてスマホのメモリを
+   使い切るので、上限を決めて超えたら捨てる。捨てても計算し直すだけで結果は変わらない。 */
+const CACHE_MAX = 120000;
 let CACHE = new Map();
 function clearCache() { CACHE = new Map(); }
 
@@ -405,11 +432,16 @@ function damageRolls(atk, dfn, mv, field, orderLate) {
     atk.status, dfn.status !== null, dfn.hp === dfn.maxHp,
     atk.hp * 3 <= atk.maxHp, field.weather, field.terrain,
     atk.types.join("/"), dfn.types.join("/"), atk.itemNow, dfn.itemNow,
-    atk.ability, dfn.ability, !!orderLate,
+    atk.ability, dfn.ability, !!orderLate, atk.proteanUsed,
+    atk.stance, dfn.stance,
     !!dfn.reflect, !!dfn.lightscreen, !!dfn.veil,
     has(HP_DEP, n) ? (atk.hp + "," + dfn.hp + "," + atk.rage) : 0].join("|");
   let v = CACHE.get(key);
-  if (v === undefined) { v = calcRolls(atk, dfn, mv, field, orderLate); CACHE.set(key, v); }
+  if (v === undefined) {
+    v = calcRolls(atk, dfn, mv, field, orderLate);
+    if (CACHE.size >= CACHE_MAX) CACHE.clear();
+    CACHE.set(key, v);
+  }
   return v;
 }
 
@@ -479,7 +511,8 @@ function calcRolls(atk, dfn, mv, field, orderLate) {
   if (isCrit) base = applyMod(base, 6144);
 
   let stab = 4096;
-  if (has(atk.types, mtype) || atk.ability === "へんげんじざい" || atk.ability === "リベロ")
+  if (has(atk.types, mtype) ||
+      ((atk.ability === "へんげんじざい" || atk.ability === "リベロ") && !atk.proteanUsed))
     stab = (atk.ability === "てきおうりょく") ? 8192 : 6144;
 
   const ra = RESIST[dfn.ability];
@@ -649,7 +682,20 @@ function opponent(name, mega) {
   return cache[k];
 }
 
-return {init, buildsOf, opponent, compat};
+/* 採用率の高い順に n 型だけ残して重みを振り直したもの。
+   候補を大量にふるいにかける場面で使う。精度は落ちるので本計算には使わない。 */
+const liteCache = {};
+function opponentLite(name, mega, n) {
+  const k = name + "|" + (mega ? 1 : 0) + "|" + n;
+  if (!liteCache[k]) {
+    const cut = opponent(name, mega).slice(0, n);
+    const s = cut.reduce((a, x) => a + x.w, 0) || 1;
+    liteCache[k] = cut.map(x => ({build: x.build, w: x.w / s, cover: x.cover}));
+  }
+  return liteCache[k];
+}
+
+return {init, buildsOf, opponent, opponentLite, compat};
 })();
 
 /* 1対1バトルのシミュレータ（battle.py の移植） */
@@ -663,6 +709,7 @@ const has = (a, x) => a.indexOf(x) >= 0;
 const sp_ = n => E.MSP[n] || {};
 const sm_ = n => E.SMV[n] || {};
 const MAXTURN = 60;
+const WBT_ = {sun: "ほのお", rain: "みず", sand: "いわ", snow: "こおり"};
 
 /* 乱数（xorshift128 / 再現性のため自前で持つ） */
 class RNG {
@@ -703,13 +750,26 @@ function transform(m, other) {
   m.moves = other.moves.slice(); m.weight = other.weight; m.transformed = true;
 }
 
+const CLEAR_BODY = ["クリアボディ", "しろいけむり", "メタルプロテクト"];
+
+// 相手が起こす能力変化。あまのじゃくで反転し、クリアボディ等は下降を無効化、
+// 実際に下がったときだけまけんき/かちきが誘発する
+function foeStatChange(mon, k, v) {
+  if (mon.ability === "あまのじゃく") v = -v;
+  if (v < 0 && CLEAR_BODY.indexOf(mon.ability) >= 0) return;
+  const before = mon.st[k];
+  mon.st[k] = clamp6(mon.st[k] + v);
+  if (v < 0 && mon.st[k] < before) {
+    if (mon.ability === "まけんき") mon.st.A = Math.min(6, mon.st.A + 2);
+    if (mon.ability === "かちき") mon.st.C = Math.min(6, mon.st.C + 2);
+  }
+}
+
 function onSwitchIn(a, b) {
   for (const [x, y] of [[a, b], [b, a]]) {
     if (x.ability === "いかく") {
       if (["せいしんりょく", "どんかん", "マイペース", "きもったま"].indexOf(y.ability) >= 0) continue;
-      y.st.A = Math.max(-6, y.st.A - 1);
-      if (y.ability === "まけんき") y.st.A = Math.min(6, y.st.A + 2);
-      if (y.ability === "かちき") y.st.C = Math.min(6, y.st.C + 2);
+      foeStatChange(y, "A", -1);
     }
   }
   if (a.ability === "かわりもの") transform(a, b);
@@ -720,8 +780,13 @@ function onSwitchIn(a, b) {
 function heal(m, amt) { m.hp = Math.min(m.maxHp, m.hp + Math.max(1, Math.trunc(amt))); }
 function dmgTo(m, d) {
   if (m.sub > 0) { m.sub = Math.max(0, m.sub - d); return 0; }
-  m.hp = Math.max(0, m.hp - d); return d;
+  // 反動も吸収も「与えたダメージ」が基準なので、残りHPを超えた分は返さない
+  d = Math.min(d, m.hp);
+  m.hp -= d; return d;
 }
+// おおきなねっこ: HP吸収技の回復量が3割増（本編準拠。チャンピオンズ側の
+// 倍率は説明文が取得できていないため本編の値を使う）
+function bigRoot(m) { return m.itemNow === "おおきなねっこ" ? 1.3 : 1.0; }
 function canStatus(t, st, field) {
   if (t.status) return false;
   if (st === "brn") {
@@ -765,8 +830,9 @@ function doStatusMove(atk, dfn, mv, field, rng) {
   if (e.rest) { if (atk.hp >= atk.maxHp) return; atk.hp = atk.maxHp; atk.status = "slp"; atk.slpTurns = 2; return; }
   if (e.wish) { atk.wish = 2; return; }
   if (e.strength_sap) {
-    if (dfn.ability === "あまのじゃく") return;
-    heal(atk, Math.trunc(dfn.stat("A"))); dfn.st.A = Math.max(-6, dfn.st.A - 1); return;
+    heal(atk, Math.trunc(dfn.stat("A") * bigRoot(atk)));
+    foeStatChange(dfn, "A", -1);   // あまのじゃくなら上がる。回復自体は起きる
+    return;
   }
   if (e.painsplit) {
     const t = Math.floor((atk.hp + dfn.hp) / 2);
@@ -850,6 +916,16 @@ function useMove(atk, dfn, mv, field, rng, first) {
       return;
     }
   }
+  // へんげんじざい/リベロ: 登場後1回だけ、出した技のタイプに変わる
+  if ((atk.ability === "へんげんじざい" || atk.ability === "リベロ") && !atk.proteanUsed) {
+    atk.types = [name === "ウェザーボール" ? (WBT_[field.weather] || "ノーマル") : mv.type];
+    atk.proteanUsed = true;
+  }
+  // バトルスイッチ: 攻撃技を出す直前にブレードフォルム、キングシールドでシールドに戻る
+  if (atk.ability === "バトルスイッチ") {
+    if (name === "キングシールド") atk.setStance("shield");
+    else if (mv.cat !== "status") atk.setStance("blade");
+  }
   if (mv.cat === "status") { doStatusMove(atk, dfn, mv, field, rng); return; }
 
   let hit;
@@ -868,7 +944,8 @@ function useMove(atk, dfn, mv, field, rng, first) {
   if (!hit) { if (sp.crash) dmgTo(atk, Math.trunc(atk.maxHp * sp.crash)); return; }
 
   if (dfn.protecting) {
-    if (dfn.protectKind === "kings" && has(mv.tags, "接触")) atk.st.A = Math.max(-6, atk.st.A - 2);
+    // チャンピオンズのキングシールドは攻撃を1段階下げる（本編の2段階ではない）
+    if (dfn.protectKind === "kings" && has(mv.tags, "接触")) foeStatChange(atk, "A", -1);
     if (dfn.protectKind === "spiky" && has(mv.tags, "接触")) dmgTo(atk, Math.floor(atk.maxHp / 8));
     if (dfn.protectKind === "psn" && has(mv.tags, "接触") && canStatus(atk, "psn", field)) atk.status = "psn";
     return;
@@ -889,27 +966,35 @@ function useMove(atk, dfn, mv, field, rng, first) {
   } else if (sp.triple) n = 3;
 
   let total = 0, broke = false;
+  let hitsTaken = 0;   // ふんどのこぶし用。連続技は1発ごとに数える
+  let cur = rolls;
   for (let i = 0; i < n; i++) {
-    let d = rng.pick(rolls);
+    // 連続技は毎回計算し直す（マルチスケイル等はHP満タンの1発目にしか乗らない）
+    if (i) cur = E.damageRolls(atk, dfn, mv, field, !first);
+    let d = rng.pick(cur);
     if (sp.triple) d = Math.trunc(d * (i + 1));
     if (dfn.disguise) { dfn.disguise = false; dmgTo(dfn, Math.floor(dfn.maxHp / 8)); broke = true; break; }
     if (dfn.itemNow === "きあいのタスキ" && dfn.hp === dfn.maxHp && d >= dfn.hp) { d = dfn.hp - 1; dfn.itemNow = null; }
     else if (dfn.ability === "がんじょう" && dfn.hp === dfn.maxHp && d >= dfn.hp) d = dfn.hp - 1;
-    total += dmgTo(dfn, d);
+    const got = dmgTo(dfn, d);
+    total += got;
+    if (got > 0) hitsTaken++;   // みがわりに当たった分は数えない
     if (!dfn.alive()) break;
   }
   if (broke) return;
   if (atk.ability === "おやこあい" && dfn.alive() && !sp.multihit && !sp.hits) {
-    let d2 = Math.trunc(rng.pick(rolls) * 0.25);
+    let d2 = Math.trunc(rng.pick(E.damageRolls(atk, dfn, mv, field, !first)) * 0.25);
     if (dfn.itemNow === "きあいのタスキ" && dfn.hp === dfn.maxHp && d2 >= dfn.hp) { d2 = dfn.hp - 1; dfn.itemNow = null; }
-    total += dmgTo(dfn, d2);
+    const got2 = dmgTo(dfn, d2);
+    total += got2;
+    if (got2 > 0) hitsTaken++;
   }
   dfn.lastDmg = total;
-  dfn.rage += total > 0 ? 1 : 0;
+  dfn.rage += hitsTaken;
 
   if (sp.recoil && ["いしあたま", "マジックガード", "すてみ"].indexOf(atk.ability) < 0)
     dmgTo(atk, Math.max(1, Math.trunc(total * sp.recoil)));
-  if (sp.drain) heal(atk, Math.trunc(total * sp.drain));
+  if (sp.drain && total > 0) heal(atk, Math.trunc(total * sp.drain * bigRoot(atk)));
   if (sp.selfko) atk.hp = 0;
   if (sp.recharge) atk.recharge = true;
   if (atk.itemNow === "いのちのたま" && atk.ability !== "マジックガード")
@@ -942,13 +1027,7 @@ function useMove(atk, dfn, mv, field, rng, first) {
   }
   for (const [k, v] of Object.entries(E.ATK_FOE[name] || {})) {
     if (!dfn.alive()) continue;
-    const vv = (dfn.ability === "あまのじゃく") ? -v : v;
-    const before = dfn.st[k];
-    dfn.st[k] = clamp6(dfn.st[k] + vv);
-    if (vv < 0 && dfn.st[k] < before) {
-      if (dfn.ability === "まけんき") dfn.st.A = Math.min(6, dfn.st.A + 2);
-      if (dfn.ability === "かちき") dfn.st.C = Math.min(6, dfn.st.C + 2);
-    }
+    foeStatChange(dfn, k, v);
   }
   if (sp.self && !sp.charge) {
     for (const [k, v] of Object.entries(sp.self)) {
@@ -983,10 +1062,10 @@ function endTurn(m, other, field, rng) {
       m.toxN = Math.min(15, m.toxN + 1);
     }
   }
-  if (m.leech && ab !== "マジックガード") {
+  if (m.leech && ab !== "マジックガード") {   // おおきなねっこは吸う側に乗る
     const d = Math.max(1, Math.floor(m.maxHp / 8));
-    dmgTo(m, d);
-    if (other.alive()) heal(other, d);
+    const got = dmgTo(m, d);
+    if (other.alive()) heal(other, Math.trunc(got * bigRoot(other)));
   }
   if (field.weather === "sand" &&
       ["すながくれ", "すなかき", "すなのちから", "マジックガード", "ぼうじん"].indexOf(ab) < 0 &&
@@ -1037,6 +1116,9 @@ function chooseMove(m, foe, field, rng) {
     for (const mv of m.moves) if (mv.name === m.choiceLock) return mv;
   }
   const dmgMoves = [];
+  // 攻撃技を選べば必ずブレードフォルムになるので、打点はブレードの数値で見積もる
+  const stance0 = m.stance;
+  if (m.ability === "バトルスイッチ") m.setStance("blade");
   for (const mv of m.moves) {
     if (mv.cat === "status") continue;
     const r = E.damageRolls(m, foe, mv, field, false);
@@ -1051,6 +1133,7 @@ function chooseMove(m, foe, field, rng) {
     if (sp.ohko) { acc = 0.3; mn = foe.hp; mx = foe.hp; av = foe.hp * 0.3; }
     dmgMoves.push({mv: mv, mn: mn, av: av, mx: mx, acc: acc, pri: mv.priority});
   }
+  m.setStance(stance0);
   let kills = dmgMoves.filter(x => x.mn >= foe.hp && x.acc >= 0.99);
   if (kills.length) {
     kills.sort((a, b) => (b.pri - a.pri) || (b.av - a.av));
@@ -1169,7 +1252,10 @@ function battle(ba, bb, rng) {
       if (atk.status === "par" && rng.next() < 0.25) continue;
       if (atk.status === "frz") { if (rng.next() < 0.2) atk.status = null; else continue; }
       const e = sm_(mv.name);
+      // useMove を通らないのでフォルム変化はここでも見る
       if (e.protect) {
+        if (atk.ability === "バトルスイッチ" && mv.name === "キングシールド")
+          atk.setStance("shield");   // 成否に関わらずシールドに戻る
         const p = 1.0 / Math.pow(3, atk.protectStreak);
         if (rng.next() < p) {
           atk.protecting = true;
@@ -1218,6 +1304,20 @@ const ITEMS = (function () {
   ].forEach(x => s.add(x));
   return Array.from(s).sort();
 })();
+
+/* 自分のパーティを編集するときは、使用率上位だけでなく全ての技から選べるようにする。
+   覚える技の一覧は元データに含まれていないため、ゲーム内の全技を候補にしている。
+   実際にその技を覚えられるかどうかの判定はしていない。 */
+const CATL = {physical: "物理", special: "特殊", status: "変化"};
+const ALLMOVES = Object.keys(DATA.moves).sort((a, b) => {
+  const x = DATA.moves[a], y = DATA.moves[b];
+  return x.t !== y.t ? x.t.localeCompare(y.t, "ja") : a.localeCompare(b, "ja");
+});
+function mvInfo(n) {
+  const m = DATA.moves[n];
+  if (!m) return "?";
+  return m.t + " " + CATL[m.c] + (m.p ? " 威力" + m.p : "");
+}
 
 /* ---------------- 検索 ---------------- */
 const toKata = s => s.replace(/[ぁ-ゖ]/g, c => String.fromCharCode(c.charCodeAt(0) + 0x60));
@@ -1393,8 +1493,10 @@ function renderParty() {
       const mf = document.createElement("div"); mf.className = "sels";
       const pool = SPD[m.name].moves.map(x => x[0]);
       for (let k = 0; k < 4; k++)
-        mf.appendChild(selBox("技" + (k + 1), pool, m.moves[k] || "", v => { m.moves[k] = v; renderParty(); }));
+        mf.appendChild(moveBox("技" + (k + 1), pool, m.moves[k] || "", v => { m.moves[k] = v; renderParty(); }));
       ed.appendChild(mf);
+      ed.appendChild(el("p", "hint", "技は全" + ALLMOVES.length +
+        "種類から選べます。覚える技のデータは持っていないので、実際に習得できるかは確認していません。"));
       card.appendChild(ed);
     }
     h.appendChild(card);
@@ -1434,6 +1536,28 @@ function selBox(label, values, cur, on) {
   s.addEventListener("change", () => on(s.value));
   w.appendChild(s); return w;
 }
+/* 技の選択欄。使用率上位を先頭のグループに、残りをタイプ順に並べる */
+function moveBox(label, top, cur, on) {
+  const w = document.createElement("label"); w.className = "sel";
+  w.innerHTML = "<span>" + label + "</span>";
+  const s = document.createElement("select");
+  const opt = (v, host, text) => {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = text || (v + "（" + mvInfo(v) + "）");
+    host.appendChild(o);
+  };
+  opt("", s, "―（なし）");
+  if (cur && ALLMOVES.indexOf(cur) < 0) opt(cur, s);   // データに無い技も消さない
+  const g1 = document.createElement("optgroup"); g1.label = "この子の使用率上位";
+  top.forEach(v => opt(v, g1));
+  if (top.length) s.appendChild(g1);
+  const g2 = document.createElement("optgroup"); g2.label = "すべての技（タイプ順）";
+  ALLMOVES.forEach(v => { if (top.indexOf(v) < 0) opt(v, g2); });
+  s.appendChild(g2);
+  s.value = cur || "";
+  s.addEventListener("change", () => on(s.value));
+  w.appendChild(s); return w;
+}
 function el(tag, cls, html) { const e = document.createElement(tag); e.className = cls; e.innerHTML = html; return e; }
 const esc = s => String(s).replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
 
@@ -1453,7 +1577,8 @@ function rowTask(m, oppName, oppMega) {
 }
 
 function runTask(t, rng, budget) {
-  if (t.same) { RATE[t.ck] = 50.0; return; }
+  const S = t.store || RATE;
+  if (t.same) { S[t.ck] = 50.0; return; }
   let tot = 0;
   for (const {build, w} of t.vs) {
     const n = Math.max(1, Math.min(NMAX, Math.round((budget || BUDGET) * w)));
@@ -1461,7 +1586,7 @@ function runTask(t, rng, budget) {
     for (let i = 0; i < n; i++) if (BAT.battle(t.build, build, rng).res === "A") win++;
     tot += w * win / n;
   }
-  RATE[t.ck] = Math.round(tot * 1000) / 10;
+  S[t.ck] = Math.round(tot * 1000) / 10;
 }
 
 function compute() {
@@ -1504,29 +1629,49 @@ function rateOf(m, f) {
 
 /* ---------------- パーティの強さ測定 ---------------- */
 const BULK = 200;                      // 測定モードの試行予算（軽めにする）
+const ALLT = () => NAMES.map(n => ({name: n, mega: !!HASMEGA[n]}));
+
+/* 画面を固まらせないように、60msごとに区切って進める */
+function chunk(tasks, rng, budget, btn, label, done) {
+  if (!tasks.length) { done(); return; }
+  btn.disabled = true;
+  let i = 0;
+  (function step() {
+    const t0 = performance.now();
+    while (i < tasks.length && performance.now() - t0 < 60) { runTask(tasks[i], rng, budget); i++; }
+    btn.textContent = label + " " + Math.round(i / tasks.length * 100) + "%";
+    if (i < tasks.length) setTimeout(step, 0); else done();
+  })();
+}
+/* 自分のメンバー1体を相手リスト全部と当てるタスク列。
+   store を分けるのは、絞り込み用の粗い値が本計算に混ざらないようにするため */
+function memberTasks(m, targets, store, nvar) {
+  const S = store || RATE;
+  const sig = sigOf(m), b = engBuild(m, "my:" + sig), out = [];
+  targets.forEach(t => {
+    const ck = sig + "@" + t.name + "|" + (t.mega ? 1 : 0);
+    if (S[ck] === undefined)
+      out.push({ck: ck, build: b, same: m.name === t.name, store: S,
+                vs: nvar ? VAR.opponentLite(t.name, t.mega, nvar) : VAR.opponent(t.name, t.mega)});
+  });
+  return out;
+}
+function rateIn(store, m, t) {
+  const v = store[sigOf(m) + "@" + t.name + "|" + (t.mega ? 1 : 0)];
+  return v === undefined ? 50 : v;
+}
+
 function measure() {
   if (!renderParty()) { setMsg("自分のパーティの設定を確認してください"); return; }
   setMsg("");
   const btn = document.getElementById("power");
-  const targets = NAMES.map(n => ({name: n, mega: !!HASMEGA[n]}));
+  const targets = ALLT();
   const tasks = [];
-  party.forEach(m => targets.forEach(t => {
-    const ck = sigOf(m) + "@" + t.name + "|" + (t.mega ? 1 : 0);
-    if (RATE[ck] === undefined)
-      tasks.push({ck: ck, build: engBuild(m, "my:" + sigOf(m)),
-                  vs: VAR.opponent(t.name, t.mega), same: m.name === t.name});
-  }));
-  if (!tasks.length) { showPower(targets); return; }
-  btn.disabled = true;
+  party.forEach(m => tasks.push.apply(tasks, memberTasks(m, targets)));
   const rng = new BAT.RNG((Date.now() ^ 0x5f3a) & 0x7fffffff);
-  let i = 0;
-  (function step() {
-    const t0 = performance.now();
-    while (i < tasks.length && performance.now() - t0 < 60) { runTask(tasks[i], rng, BULK); i++; }
-    btn.textContent = "測定中… " + Math.round(i / tasks.length * 100) + "%";
-    if (i < tasks.length) setTimeout(step, 0);
-    else { btn.disabled = false; btn.textContent = "パーティの強さを測定"; showPower(targets); }
-  })();
+  chunk(tasks, rng, BULK, btn, "測定中…", () => {
+    btn.disabled = false; btn.textContent = "パーティの強さを測定"; showPower(targets);
+  });
 }
 
 function tile(label, v, n, note, warn) {
@@ -1576,6 +1721,138 @@ function showPower(targets) {
        "測定は試行数を抑えているため、個別の数値は選出計算よりわずかにブレます。</p></div>";
   document.getElementById("power_out").innerHTML = h;
   document.getElementById("power_out").scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+/* ---------------- パーティの改善案 ---------------- */
+const SCR = {};        // 絞り込み用の勝率（精度が低いので本計算とは分ける）
+const SCRBUDGET = 60;  // 絞り込みの試行予算
+const SCRVAR = 8;      // 絞り込みで使う相手の型数（本計算は約100型）
+const NWEAK = 14;      // 手当てを狙う相手の数
+const NTOP = 4;        // 精査にかける候補数
+const MINGAIN = 0.5;   // これ未満の改善は誤差とみなす
+let PLANS = [];
+
+const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+const coverOf = (mem, targets) => targets.map(t => Math.max.apply(null, mem.map(m => rateOf(m, t))));
+
+function suggest() {
+  if (!renderParty()) { setMsg("自分のパーティの設定を確認してください"); return; }
+  setMsg("");
+  const btn = document.getElementById("sug");
+  const targets = ALLT();
+  const rng = new BAT.RNG((Date.now() ^ 0x2c9f) & 0x7fffffff);
+  const t1 = [];
+  party.forEach(m => t1.push.apply(t1, memberTasks(m, targets)));
+  chunk(t1, rng, BULK, btn, "現状を測定中…", () => sugScreen(targets, rng, btn));
+}
+
+/* 候補全部を「苦手な相手」だけにぶつけて絞り込む */
+function sugScreen(targets, rng, btn) {
+  const cov = coverOf(party, targets);
+  const weak = targets.map((t, i) => ({t: t, cur: cov[i]}))
+    .sort((a, b) => a.cur - b.cur).slice(0, NWEAK);
+  const have = new Set(party.map(m => m.name));
+  const cands = [];
+  NAMES.forEach(n => {
+    if (have.has(n)) return;
+    cands.push(defaultBuild(n, false));
+    if (HASMEGA[n]) cands.push(defaultBuild(n, true));
+  });
+  const wt = weak.map(x => x.t), tasks = [];
+  cands.forEach(c => tasks.push.apply(tasks, memberTasks(c, wt, SCR, SCRVAR)));
+  chunk(tasks, rng, SCRBUDGET, btn, "候補を絞り込み中…",
+        () => sugFull(targets, cov, weak, cands, rng, btn));
+}
+
+/* 見込みのある候補だけ、上位100体すべてを本来の精度で測り直す */
+function sugFull(targets, cov, weak, cands, rng, btn) {
+  cands.forEach(c => {
+    let g = 0;
+    weak.forEach(x => { const r = rateIn(SCR, c, x.t); if (r > x.cur) g += r - x.cur; });
+    c._gain = g;
+  });
+  const top = cands.slice().sort((a, b) => b._gain - a._gain).slice(0, NTOP);
+  const tasks = [];
+  top.forEach(c => tasks.push.apply(tasks, memberTasks(c, targets)));
+  chunk(tasks, rng, BULK, btn, "有力候補を精査中…", () => showSuggest(targets, cov, top, btn));
+}
+
+function showSuggest(targets, cov, top, btn) {
+  btn.disabled = false; btn.textContent = "パーティの改善案";
+  const base = {cover: mean(cov), holes: cov.filter(v => v < 50).length};
+  PLANS = [];
+  top.forEach(c => {
+    let best = null;
+    for (let j = 0; j < 6; j++) {
+      const mem = party.slice(); mem[j] = c;
+      const nc = coverOf(mem, targets);
+      let fixed = [], broke = [];
+      targets.forEach((t, i) => {
+        if (cov[i] < 50 && nc[i] >= 50) fixed.push(labelOfFoe(t));
+        if (cov[i] >= 50 && nc[i] < 50) broke.push(labelOfFoe(t));
+      });
+      const items = mem.map(m => m.item).filter(x => x && x !== "なし");
+      const p = {c: c, j: j, cover: mean(nc), holes: nc.filter(v => v < 50).length,
+                 fixed: fixed, broke: broke, megas: mem.filter(m => m.mega).length,
+                 dupItem: new Set(items).size !== items.length};
+      if (!best || p.cover > best.cover) best = p;
+    }
+    PLANS.push(best);
+  });
+  PLANS.sort((a, b) => b.cover - a.cover);
+
+  let h = '<div class="card"><h2>パーティの改善案' +
+    '<span class="sub">現状 対応力 ' + base.cover.toFixed(1) + '% / 勝てない相手 ' + base.holes + '体</span></h2>';
+  const good = PLANS.filter(p => p.cover >= base.cover + MINGAIN || p.holes < base.holes);
+  if (!good.length) {
+    h += '<p class="kv ok">1体入れ替えて改善する案は見つかりませんでした。' +
+         '面の広さでは埋まっているので、ここから先は個々の型（技・持ち物・振り方）を詰める段階です。</p>' +
+         '<p class="hint">参考までに最も差が小さかった案を並べますが、下の数字は測定誤差と同じ程度の大きさです。</p>';
+  }
+  h += '<div class="scroll"><table><tr><th class="rowh">入れ替え</th><th>対応力</th>' +
+       '<th>勝てない相手</th><th>埋まる穴</th><th>新たな穴</th><th></th></tr>';
+  PLANS.forEach((p, k) => {
+    const d = p.cover - base.cover, c = cellColor(d > 0 ? 70 : 40);
+    h += '<tr><td class="rowh">' + esc(labelOf(party[p.j])) + " → " + esc(labelOf(p.c)) + '</td>' +
+      '<td style="background:' + c[0] + ';color:' + c[1] + '">' + p.cover.toFixed(1) +
+      '<small> (' + (d >= 0 ? "+" : "") + d.toFixed(1) + ')</small></td>' +
+      '<td>' + p.holes + '<small> / ' + base.holes + '</small></td>' +
+      '<td style="text-align:left">' + (p.fixed.length ? esc(p.fixed.slice(0, 4).join("、")) +
+        (p.fixed.length > 4 ? " 他" + (p.fixed.length - 4) + "体" : "") : "―") + '</td>' +
+      '<td style="text-align:left">' + (p.broke.length ? esc(p.broke.slice(0, 4).join("、")) +
+        (p.broke.length > 4 ? " 他" + (p.broke.length - 4) + "体" : "") : "―") + '</td>' +
+      '<td><button onclick="applyPlan(' + k + ')">適用</button></td></tr>';
+  });
+  h += "</table></div>";
+  PLANS.forEach(p => {
+    const w = [];
+    if (p.dupItem) w.push("持ち物が他のメンバーと重複します");
+    if (p.megas > 2) w.push("メガシンカが" + p.megas + "体になります");
+    if (p.megas === 0) w.push("メガシンカがいなくなります");
+    if (w.length) h += '<p class="kv ng">' + esc(labelOf(p.c)) + ": " + esc(w.join(" / ")) + "</p>";
+  });
+  h += '<p class="hint">候補は上位100体の使用率1位の型です。入れ替え先は' +
+       '「対応力が最も上がる枠」を自動で選んでいます。適用しても保存はされないので、' +
+       '気に入らなければ「クリア」や「推奨パーティに戻す」で戻せます。' +
+       '技や振り方は適用後に自分で調整してください。</p></div>';
+  const O = document.getElementById("sug_out");
+  O.innerHTML = h;
+  O.scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+function applyPlan(k) {
+  const p = PLANS[k];
+  if (!p) return;
+  const c = p.c;
+  party[p.j] = {name: c.name, mega: c.mega, ability: c.ability, nature: c.nature,
+                item: c.item, points: Object.assign({}, c.points), moves: c.moves.slice()};
+  sel = p.j;
+  document.getElementById("power_out").innerHTML = "";
+  document.getElementById("sug_out").innerHTML = "";
+  document.getElementById("out").innerHTML = "";
+  renderParty();
+  setMsg(labelOf(party[p.j]) + " に入れ替えました（保存はまだです）");
+  document.getElementById("mydet").open = true;
 }
 
 /* ---------------- 結果 ---------------- */
@@ -1692,6 +1969,7 @@ function clearParty() {
   party = Array.from({length: 6}, emptyMember);
   sel = 0;
   document.getElementById("power_out").innerHTML = "";
+  document.getElementById("sug_out").innerHTML = "";
   document.getElementById("out").innerHTML = "";
   renderParty();
 }
