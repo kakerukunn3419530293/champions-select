@@ -106,9 +106,13 @@ details summary{font-size:13px;cursor:pointer;color:var(--accent);padding:4px 0}
     <div class="tools">
       <button onclick="saveParty()">保存</button>
       <button onclick="loadDefault()">推奨パーティに戻す</button>
+      <button id="power" onclick="measure()">パーティの強さを測定</button>
     </div>
+    <p class="hint">「強さを測定」は上位100体すべてと戦わせます（スマホで1〜2分）。</p>
   </details>
 
+  <p class="msg" id="msg"></p>
+  <div id="power_out"></div>
   <div id="out"></div>
 
   <details class="card">
@@ -1425,11 +1429,11 @@ function rowTask(m, oppName, oppMega) {
   return {ck: ck, build: engBuild(m, "my:" + sig), vs: VAR.opponent(oppName, oppMega), same: m.name === oppName};
 }
 
-function runTask(t, rng) {
+function runTask(t, rng, budget) {
   if (t.same) { RATE[t.ck] = 50.0; return; }
   let tot = 0;
   for (const {build, w} of t.vs) {
-    const n = Math.max(1, Math.min(NMAX, Math.round(BUDGET * w)));
+    const n = Math.max(1, Math.min(NMAX, Math.round((budget || BUDGET) * w)));
     let win = 0;
     for (let i = 0; i < n; i++) if (BAT.battle(t.build, build, rng).res === "A") win++;
     tot += w * win / n;
@@ -1438,13 +1442,22 @@ function runTask(t, rng) {
 }
 
 function compute() {
-  const msg = document.getElementById("msg");
+  try { compute_(); }
+  catch (e) {
+    const b = document.getElementById("go");
+    if (b) { b.disabled = false; b.textContent = "選出を計算"; }
+    setMsg("計算中にエラーが発生しました: " + e.message);
+  }
+}
+function setMsg(t) { const m = document.getElementById("msg"); if (m) m.textContent = t; }
+
+function compute_() {
   const bad = [];
   foes.forEach((f, i) => { if (!SPD[f.name]) bad.push("相手" + (i + 1)); });
-  if (bad.length) { msg.textContent = "未入力の枠があります: " + bad.join("、"); return; }
-  if (new Set(foes.map(f => f.name)).size !== 6) { msg.textContent = "相手のパーティにポケモンの重複があります"; return; }
-  if (!renderParty()) { msg.textContent = "自分のパーティの設定を確認してください"; return; }
-  msg.textContent = "";
+  if (bad.length) { setMsg("未入力の枠があります: " + bad.join("、")); return; }
+  if (new Set(foes.map(f => f.name)).size !== 6) { setMsg("相手のパーティにポケモンの重複があります"); return; }
+  if (!renderParty()) { setMsg("自分のパーティの設定を確認してください"); return; }
+  setMsg("");
   const tasks = [];
   party.forEach(m => foes.forEach(f => { const t = rowTask(m, f.name, f.mega); if (t) tasks.push(t); }));
   const btn = document.getElementById("go");
@@ -1464,6 +1477,66 @@ function compute() {
 function rateOf(m, f) {
   const v = RATE[sigOf(m) + "@" + f.name + "|" + (f.mega ? 1 : 0)];
   return v === undefined ? 50 : v;
+}
+
+/* ---------------- パーティの強さ測定 ---------------- */
+const BULK = 200;                      // 測定モードの試行予算（軽めにする）
+function measure() {
+  if (!renderParty()) { setMsg("自分のパーティの設定を確認してください"); return; }
+  setMsg("");
+  const btn = document.getElementById("power");
+  const targets = NAMES.map(n => ({name: n, mega: !!HASMEGA[n]}));
+  const tasks = [];
+  party.forEach(m => targets.forEach(t => {
+    const ck = sigOf(m) + "@" + t.name + "|" + (t.mega ? 1 : 0);
+    if (RATE[ck] === undefined)
+      tasks.push({ck: ck, build: engBuild(m, "my:" + sigOf(m)),
+                  vs: VAR.opponent(t.name, t.mega), same: m.name === t.name});
+  }));
+  if (!tasks.length) { showPower(targets); return; }
+  btn.disabled = true;
+  const rng = new BAT.RNG((Date.now() ^ 0x5f3a) & 0x7fffffff);
+  let i = 0;
+  (function step() {
+    const t0 = performance.now();
+    while (i < tasks.length && performance.now() - t0 < 60) { runTask(tasks[i], rng, BULK); i++; }
+    btn.textContent = "測定中… " + Math.round(i / tasks.length * 100) + "%";
+    if (i < tasks.length) setTimeout(step, 0);
+    else { btn.disabled = false; btn.textContent = "パーティの強さを測定"; showPower(targets); }
+  })();
+}
+
+function showPower(targets) {
+  const rows = party.map(m => {
+    const rs = targets.map(t => rateOf(m, t));
+    const pair = targets.map((t, i) => [rs[i], ENG.formOf(SPD[t.name], t.mega).label])
+      .sort((a, b) => a[0] - b[0]);
+    return {m: m, avg: rs.reduce((s, v) => s + v, 0) / rs.length,
+            win: rs.filter(v => v > 55).length, lose: rs.filter(v => v < 45).length,
+            weak: pair.slice(0, 3)};
+  });
+  const order = rows.map((r, i) => i).sort((a, b) => rows[b].avg - rows[a].avg);
+  const cover = targets.map(t => Math.max.apply(null, party.map(m => rateOf(m, t))));
+  const holes = targets.map((t, i) => [cover[i], ENG.formOf(SPD[t.name], t.mega).label])
+    .filter(x => x[0] < 50).sort((a, b) => a[0] - b[0]);
+  let h = '<div class="card"><h2>パーティの強さ<span class="sub">上位100体すべてとの対戦結果</span></h2>';
+  h += '<p class="kv"><b>対応力 ' + (cover.reduce((s, v) => s + v, 0) / cover.length).toFixed(1) +
+       '%</b>　（相手1体ごとに最も有利な味方を当てたときの平均勝率）</p>';
+  h += '<div class="scroll"><table><tr><th class="rowh">ポケモン</th><th>平均勝率</th><th>有利</th><th>不利</th><th>苦手な相手</th></tr>';
+  for (const i of order) {
+    const r = rows[i], c = cellColor(r.avg);
+    h += '<tr><td class="rowh">' + esc(labelOf(r.m)) + '</td>' +
+      '<td style="background:' + c[0] + ';color:' + c[1] + '">' + r.avg.toFixed(1) + '</td>' +
+      "<td>" + r.win + "</td><td>" + r.lose + "</td><td style=\"text-align:left\">" +
+      r.weak.map(w => esc(w[1]) + " " + w[0].toFixed(0) + "%").join("、") + "</td></tr>";
+  }
+  h += "</table></div>";
+  h += '<p class="kv ' + (holes.length ? "ng" : "ok") + '" style="margin-top:6px">6体全員が5割未満の相手: ' +
+       (holes.length ? holes.map(x => esc(x[1]) + " " + x[0].toFixed(0) + "%").join("、") : "なし") + "</p>";
+  h += '<p class="hint">「有利」は勝率55%超、「不利」は45%未満の相手の数です。' +
+       "測定は試行数を抑えているため、個別の数値は選出計算よりわずかにブレます。</p></div>";
+  document.getElementById("power_out").innerHTML = h;
+  document.getElementById("power_out").scrollIntoView({behavior: "smooth", block: "start"});
 }
 
 /* ---------------- 結果 ---------------- */
