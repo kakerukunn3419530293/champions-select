@@ -680,30 +680,41 @@ function calcRolls(atk, dfn, mv, field, orderLate, crit) {
   return out;
 }
 
-/* メガフォルムの選択（Python の mega_form_key と同じ規則） */
-function megaFormKey(v) {
-  const item = v.items[0][0];
-  if (item.indexOf("ナイト") < 0) return null;
-  const last = item[item.length - 1];
-  const suf = ("ＸＹＺ".indexOf(last) >= 0) ? last : "";
+/* 使用率順位に関係なく、対応するメガストーンとメガフォルムを探す。 */
+function megaData(v) {
   const cands = Object.keys(v.forms).filter(k => (v.forms[k].form || "").startsWith("メガ"));
   if (!cands.length) return null;
-  if (suf) {
-    for (const k of cands) if (v.forms[k].form.endsWith(suf)) return k;
-  } else {
-    for (const k of cands) {
-      const f = v.forms[k].form;
-      if ("ＸＹＺ".indexOf(f[f.length - 1]) < 0) return k;
+
+  for (const row of v.items) {
+    const item = row[0];
+    if (item.indexOf("ナイト") < 0) continue;
+    const last = item[item.length - 1];
+    const suf = ("ＸＹＺ".indexOf(last) >= 0) ? last : "";
+    if (suf) {
+      for (const k of cands) if (v.forms[k].form.endsWith(suf)) return {key: k, item: item};
+    } else {
+      for (const k of cands) {
+        const f = v.forms[k].form;
+        if ("ＸＹＺ".indexOf(f[f.length - 1]) < 0) return {key: k, item: item};
+      }
     }
   }
   return null;
+}
+function megaFormKey(v) {
+  const d = megaData(v);
+  return d ? d.key : null;
+}
+function megaItem(v) {
+  const d = megaData(v);
+  return d ? d.item : null;
 }
 function formOf(v, mega) {
   const k = mega ? megaFormKey(v) : null;
   return v.forms[k || v.key];
 }
 
-return {init, Mon, Field, damageRolls, critChance, realStats, clearCache, megaFormKey, formOf,
+return {init, Mon, Field, damageRolls, critChance, realStats, clearCache, megaFormKey, megaItem, formOf,
         pround, chain, applyMod, stageMul, typeEffect, abilityImmune, movePower,
         activeItem, isGrounded, moveType, abilityIsIgnored, sheerForceEligible,
         MOLD_BREAKER_ABILITIES,
@@ -768,7 +779,7 @@ function buildsOf(name, mega, opt) {
   }
 
   let items;
-  if (mk) items = [[v.items[0][0], 1.0]];
+  if (mk) items = [[E.megaItem(v), 1.0]];
   else {
     let cand = v.items.filter(x => x[0].indexOf("ナイト") < 0).slice(0, nItem);
     if (!cand.length) cand = [["なし", 1]];
@@ -2434,7 +2445,7 @@ function renderParty() {
 
 function itemPool(m) {
   const v = SPD[m.name];
-  if (m.mega) return [v.items[0][0]];
+  if (m.mega) return [ENG.megaItem(v)];
   const used = v.items.filter(x => ITEMS.indexOf(x[0]) >= 0).map(x => x[0]);
   return used.concat(ITEMS.filter(x => used.indexOf(x) < 0));
 }
