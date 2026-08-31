@@ -2194,15 +2194,26 @@ const STATK = ["H", "A", "B", "C", "D", "S"];
 const STATL = {H: "HP", A: "攻撃", B: "防御", C: "特攻", D: "特防", S: "素早さ"};
 const HASMEGA = {};
 NAMES.forEach(n => HASMEGA[n] = !!ENG.megaFormKey(SPD[n]));
-const ITEMS = (function () {
-  const t = DATA.tables;
-  const s = new Set(Object.keys(t.berry).concat(Object.keys(t.typeItem)));
-  ["きあいのタスキ", "オボンのみ", "たべのこし", "いのちのたま", "こだわりスカーフ",
-   "たつじんのおび", "しろいハーブ", "こうかくレンズ", "ひかりのねんど", "ひかりのこな",
-   "せんせいのツメ", "おうじゃのしるし", "するどいキバ", "きあいのハチマキ", "なし"
-  ].forEach(x => s.add(x));
-  return Array.from(s).filter(x => !CHAMPIONS_PAST_ITEMS.has(x)).sort();
-})();
+// Champions で使用できる通常の持ち物を全て列挙する。
+// 使用率データに登場しない持ち物も、自分のパーティでは選択できるようにする。
+const ITEMS = [
+  "あついいわ", "イトケのみ", "いのちのたま", "ウタンのみ", "オッカのみ", "オボンのみ",
+  "オレンのみ", "おうじゃのしるし", "おおきなねっこ", "かいがらのすず", "カゴのみ",
+  "カシブのみ", "かたいいし", "きあいのタスキ", "きあいのハチマキ", "きせきのタネ",
+  "きれいなぬけがら", "ぎんのこな", "キーのみ", "クラボのみ", "くろいてっきゅう",
+  "くろいメガネ", "くろおび", "こうかくレンズ", "こだわりスカーフ", "さらさらいわ",
+  "じしゃく", "しめったいわ", "シュカのみ", "シルクのスカーフ", "しろいハーブ",
+  "しんぴのしずく", "するどいくちばし", "せんせいのツメ", "ソクノのみ", "タンガのみ",
+  "たつじんのおび", "たべのこし", "チーゴのみ", "ちからのハチマキ", "つめたいいわ",
+  "でんきだま", "どくバリ", "とけないこおり", "ナナシのみ", "ナモのみ", "なし",
+  "のろいのおふだ", "ハバンのみ", "バコウのみ", "ヒメリのみ", "ビアーのみ", "ひかりのこな",
+  "ひかりのねんど", "ピントレンズ", "フォーカスレンズ", "ホズのみ", "まがったスプーン",
+  "メタルコート", "メトロノーム", "メンタルハーブ", "ものしりメガネ", "もくたん", "モモのみ",
+  "やわらかいすな", "ヤチェのみ", "ようせいのハネ", "ヨプのみ", "ヨロギのみ", "ラムのみ",
+  "リリバのみ", "リンドのみ", "りゅうのキバ", "ロゼルのみ",
+].sort((a, b) => a.localeCompare(b, "ja"));
+// 埋め込みデータの旧称も、画面で使う現在の日本語名に対応させる。
+DATA.tables.typeItem["シルクのスカーフ"] = "ノーマル";
 
 /* 自分のパーティを編集するときは、使用率上位だけでなく全ての技から選べるようにする。
    覚える技の一覧は元データに含まれていないため、ゲーム内の全技を候補にしている。
@@ -2371,6 +2382,8 @@ function renderParty() {
       sels.appendChild(selBox("性格", NATURES, m.nature, v => { m.nature = v; renderParty(); }));
       sels.appendChild(selBox("持ち物", itemPool(m), m.item, v => { m.item = v; renderParty(); }));
       ed.appendChild(sels);
+      if (!m.mega) ed.appendChild(el("p", "hint", "持ち物は使用率にないものを含む全" +
+        (ITEMS.length - 1) + "種類から選べます。"));
       const pf = document.createElement("div"); pf.className = "pts";
       STATK.forEach(k => {
         const w = document.createElement("label");
@@ -2422,7 +2435,7 @@ function renderParty() {
 function itemPool(m) {
   const v = SPD[m.name];
   if (m.mega) return [v.items[0][0]];
-  const used = v.items.filter(x => x[0].indexOf("ナイト") < 0 && !CHAMPIONS_PAST_ITEMS.has(x[0])).map(x => x[0]);
+  const used = v.items.filter(x => ITEMS.indexOf(x[0]) >= 0).map(x => x[0]);
   return used.concat(ITEMS.filter(x => used.indexOf(x) < 0));
 }
 function selBox(label, values, cur, on) {
