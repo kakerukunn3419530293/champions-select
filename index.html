@@ -51,6 +51,8 @@ input[type=text]:focus,select:focus,input[type=number]:focus{outline:2px solid v
 .sels{display:flex;flex-wrap:wrap;gap:8px}
 .sel{display:flex;flex-direction:column;gap:2px;font-size:11px;color:var(--sub)}
 .sel select{font-size:14px;padding:8px}
+.calc-mode{min-width:min(100%,340px);flex:1}
+.calc-mode select{width:100%}
 .pts{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
 .pts label{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--sub)}
 .pts input{width:100%;font-size:15px;padding:7px}
@@ -59,6 +61,8 @@ input[type=text]:focus,select:focus,input[type=number]:focus{outline:2px solid v
 .kv2.stat{color:var(--ink)}
 .ok{color:#1b7a3d}.ng{color:#c62828}
 .tools{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.mode{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);padding:7px 2px;cursor:pointer}
+.mode input{width:17px;height:17px;accent-color:var(--accent)}
 button{font:inherit;font-size:13px;padding:9px 12px;border:1px solid var(--line);border-radius:9px;
   background:var(--card);color:var(--ink);cursor:pointer}
 button.pri{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:700}
@@ -104,7 +108,18 @@ details summary{font-size:13px;cursor:pointer;color:var(--accent);padding:4px 0}
   <div class="card">
     <h2>相手のパーティ<span class="sub">カタカナ / ひらがな / ローマ字</span></h2>
     <div id="foes"></div>
-    <div class="tools"><button onclick="clearFoes()">クリア</button></div>
+    <div class="tools">
+      <button onclick="clearFoes()">クリア</button>
+      <label class="sel calc-mode"><span>選出計算モード</span>
+        <select id="calc_mode" onchange="updateCalcMode()">
+          <option value="standard">既存の総合評価</option>
+          <option value="maximin">純戦略Maximin</option>
+          <option value="nash">混合戦略Nash均衡（近似）</option>
+          <option value="bayes">選出利得行列＋ベイズ期待値＋下側CVaR</option>
+        </select>
+      </label>
+    </div>
+    <p class="hint" id="calc_mode_desc"></p>
   </div>
 
   <details class="card" id="mydet">
@@ -118,7 +133,9 @@ details summary{font-size:13px;cursor:pointer;color:var(--accent);padding:4px 0}
       <button id="power" onclick="measure()">パーティの強さを測定</button>
       <button id="sug" onclick="suggest()">パーティの改善案</button>
     </div>
-    <p class="hint">「強さを測定」は上位100体すべてと戦わせます（スマホで1〜2分）。
+    <label class="mode"><input id="keepmega" type="checkbox">改善案ではメガシンカ枠を固定する</label>
+    <p class="hint">「強さを測定」は上位100体すべてと戦わせます（スマホで1〜3分）。
+    測定結果には最も苦手な6体パーティと、その中で最も厳しい3体選出も表示します。
     「改善案」は1体入れ替えたときに対応力がどう変わるかを探します（さらに1〜2分）。</p>
   </details>
 
@@ -145,6 +162,19 @@ details summary{font-size:13px;cursor:pointer;color:var(--accent);padding:4px 0}
         <li>ダメージ式は本家準拠（4096基準の補正／チェーンは四捨五入・適用は五捨五超入）</li>
         <li>天候・フィールド・特性・持ち物・壁・状態異常・積み技・回復技を反映</li>
       </ul>
+
+      <p><b>選出の評価式</b><br>
+      勝率行列をP、選んだ3体をIとして、対応範囲C＝相手ごとの最大勝率の平均、
+      最悪対面W＝その最小値、選出の厚みS＝全対面の平均とし、
+      <b>U＝0.5C＋0.2W＋0.3S</b>が最大になる選出を採用します。
+      「既存の総合評価」は従来どおり相手6体全体へのUを最大化します。</p>
+      <ul>
+        <li>純戦略Maximin: 相手の全選出に対するUの最小値を最大化</li>
+        <li>混合戦略Nash均衡: 最大20×20の選出利得行列をMultiplicative Weightsで近似</li>
+        <li>ベイズ＋下側CVaR: 一様事前分布と相手側Uから選出確率を推定し、期待値75%＋下側20% CVaR 25%を最大化</li>
+      </ul>
+      <p class="hint">6体から3体の組は最大20通りです。メガシンカを2体以上含む選出は除外するため、
+      メガ枠が複数あるパーティでは利得行列が20×20未満になる場合があります。</p>
 
       <p><b>反映していないこと</b></p>
       <ul>
@@ -2562,9 +2592,198 @@ function rateSel(m, f) {   // 選出計算用
   return v === undefined ? 50 : v;
 }
 
+/* ---------------- 選出最適化 ----------------
+   勝率行列 P[i][j]（味方 i 対 相手 j）を作り、選出 I の評価を
+     C(I) = mean_j max_{i∈I} P[i][j]       対応範囲
+     W(I) = min_j  max_{i∈I} P[i][j]       最悪対面
+     S(I) = mean_{i∈I,j} P[i][j]           選出の厚み
+     U(I) = 0.5 C(I) + 0.2 W(I) + 0.3 S(I)
+   として最大化する。通常選出と苦手選出で同じ定義を共有する。 */
+const SELECT_WEIGHT = Object.freeze({cover: .5, worst: .2, solid: .3});
+const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+
+function payoffMatrix(members, targets, rateFn) {
+  return members.map(m => targets.map(t => rateFn(m, t)));
+}
+
+function legalTrios(members) {
+  return combos3(members.map((m, i) => i))
+    .filter(trio => trio.filter(i => members[i].mega).length <= 1);
+}
+
+/* 1つの味方選出について、相手1体ごとの最大勝率と平均勝率を前計算する。 */
+function selectionProfile(matrix, trio) {
+  const n = matrix[0].length, best = new Float64Array(n), avg = new Float64Array(n);
+  for (let j = 0; j < n; j++) {
+    let mx = -Infinity, sum = 0;
+    for (const i of trio) { const v = matrix[i][j]; if (v > mx) mx = v; sum += v; }
+    best[j] = mx;
+    avg[j] = sum / trio.length;
+  }
+  return {trio: trio, best: best, avg: avg};
+}
+
+function profileMetrics(profile, columns) {
+  let cover = 0, worst = Infinity, solid = 0;
+  for (const j of columns) {
+    const b = profile.best[j];
+    cover += b;
+    if (b < worst) worst = b;
+    solid += profile.avg[j];
+  }
+  cover /= columns.length;
+  solid /= columns.length;
+  return {trio: profile.trio, cover: cover, worst: worst, solid: solid,
+          score: SELECT_WEIGHT.cover * cover + SELECT_WEIGHT.worst * worst + SELECT_WEIGHT.solid * solid};
+}
+
+function compareMetrics(a, b) {
+  return (b.score - a.score) || (b.worst - a.worst) ||
+    (b.cover - a.cover) || (b.solid - a.solid);
+}
+
+function rankSelectionProfiles(profiles, columns) {
+  return profiles.map(p => profileMetrics(p, columns)).sort(compareMetrics);
+}
+
+const CALC_MODE_DESC = {
+  standard: "既存方式: 相手6体への対応範囲50%・最悪対面20%・選出の厚み30%で評価します。",
+  maximin: "相手の合法な3体選出すべてを想定し、最悪の場合の評価が最も高い1組を選びます。",
+  nash: "双方の最大20通りをゼロ和ゲームとして解き、読まれにくい選出確率を求めます。",
+  bayes: "最大20×20の選出利得行列を作り、推定選出確率での期待値75%・下側20% CVaR 25%で評価します。",
+};
+const BAYES_BETA = .08, CVAR_ALPHA = .20, CVAR_WEIGHT = .25;
+
+function currentCalcMode() {
+  const e = document.getElementById("calc_mode");
+  return e && CALC_MODE_DESC[e.value] ? e.value : "standard";
+}
+function updateCalcMode() {
+  const mode = currentCalcMode();
+  const d = document.getElementById("calc_mode_desc");
+  if (d) d.textContent = CALC_MODE_DESC[mode];
+  const out = document.getElementById("out");
+  if (out) out.innerHTML = "";
+}
+
+function selectionGameMatrix(profiles, opponentTrios) {
+  return profiles.map(p => opponentTrios.map(cols => profileMetrics(p, cols).score));
+}
+
+function softmax(values, scale) {
+  const z = values.map(v => v * scale), mx = Math.max.apply(null, z);
+  const ex = z.map(v => Math.exp(v - mx)), sum = ex.reduce((s, v) => s + v, 0) || 1;
+  return ex.map(v => v / sum);
+}
+
+/* 相手側の強さを 100-P の転置行列で近似し、Gibbs/softmax事前分布にする。 */
+function estimatedOpponentPrior(matrix, opponentTrios) {
+  const enemyMatrix = Array.from({length: matrix[0].length}, (_, j) =>
+    Array.from({length: matrix.length}, (_, i) => 100 - matrix[i][j]));
+  const columns = matrix.map((row, i) => i);
+  const scores = opponentTrios.map(trio =>
+    profileMetrics(selectionProfile(enemyMatrix, trio), columns).score);
+  return {probabilities: softmax(scores, BAYES_BETA), scores: scores};
+}
+
+/* 下側alpha確率質量の加重平均。値が小さいシナリオから確率を切り取る。 */
+function lowerTailCVaR(values, probabilities, alpha) {
+  const order = values.map((v, i) => i).sort((a, b) => values[a] - values[b]);
+  let left = alpha, total = 0;
+  for (const i of order) {
+    const take = Math.min(left, probabilities[i]);
+    total += take * values[i]; left -= take;
+    if (left <= 1e-12) break;
+  }
+  return total / Math.max(1e-12, alpha - Math.max(0, left));
+}
+
+/* Multiplicative Weights の平均戦略で有限ゼロ和ゲームのNash均衡を近似する。 */
+function solveZeroSumGame(game, iterations) {
+  const m = game.length, n = game[0].length, T = iterations || 20000;
+  const rowGain = new Float64Array(m), colCost = new Float64Array(n);
+  const sumRow = new Float64Array(m), sumCol = new Float64Array(n);
+  const eta = Math.sqrt(8 * Math.log(Math.max(2, m, n)) / T);
+  for (let t = 0; t < T; t++) {
+    const x = softmax(Array.from(rowGain), eta);
+    const y = softmax(Array.from(colCost), -eta);
+    for (let i = 0; i < m; i++) sumRow[i] += x[i];
+    for (let j = 0; j < n; j++) sumCol[j] += y[j];
+    for (let i = 0; i < m; i++) {
+      let u = 0; for (let j = 0; j < n; j++) u += game[i][j] * y[j] / 100;
+      rowGain[i] += u;
+    }
+    for (let j = 0; j < n; j++) {
+      let u = 0; for (let i = 0; i < m; i++) u += x[i] * game[i][j] / 100;
+      colCost[j] += u;
+    }
+  }
+  const row = Array.from(sumRow, v => v / T), col = Array.from(sumCol, v => v / T);
+  const lowerByCol = Array.from({length: n}, (_, j) =>
+    row.reduce((s, x, i) => s + x * game[i][j], 0));
+  const upperByRow = Array.from({length: m}, (_, i) =>
+    col.reduce((s, y, j) => s + y * game[i][j], 0));
+  const lower = Math.min.apply(null, lowerByCol), upper = Math.max.apply(null, upperByRow);
+  return {row: row, col: col, lower: lower, upper: upper,
+          value: (lower + upper) / 2, exploitability: upper - lower};
+}
+
+function selectionDecision(mode, members, opponents, matrix) {
+  const ownTrios = legalTrios(members), opponentTrios = legalTrios(opponents);
+  const profiles = ownTrios.map(trio => selectionProfile(matrix, trio));
+  const allColumns = opponents.map((f, i) => i);
+  const standard = profiles.map(p => profileMetrics(p, allColumns));
+  if (!profiles.length || !opponentTrios.length) return null;
+
+  if (mode === "standard") {
+    const rankedMetrics = standard.slice().sort(compareMetrics);
+    return {mode: mode, rows: rankedMetrics.map(m => ({trio: m.trio, value: m.score,
+      secondary: m.worst, metrics: m})), best: rankedMetrics[0], opponentTrios: opponentTrios};
+  }
+
+  const game = selectionGameMatrix(profiles, opponentTrios);
+  if (mode === "maximin") {
+    const rows = game.map((values, a) => {
+      const value = Math.min.apply(null, values), worstIndex = values.indexOf(value);
+      return {a: a, trio: ownTrios[a], value: value, secondary: mean(values),
+              worstOpponent: opponentTrios[worstIndex], metrics: standard[a]};
+    }).sort((x, y) => (y.value - x.value) || (y.secondary - x.secondary) || compareMetrics(x.metrics, y.metrics));
+    return {mode: mode, rows: rows, best: rows[0].metrics, opponentTrios: opponentTrios, game: game};
+  }
+
+  if (mode === "nash") {
+    const equilibrium = solveZeroSumGame(game);
+    const rows = equilibrium.row.map((probability, a) => ({a: a, trio: ownTrios[a],
+      value: probability * 100, secondary: Math.min.apply(null, game[a]),
+      probability: probability, metrics: standard[a]}))
+      .sort((x, y) => (y.probability - x.probability) || (y.secondary - x.secondary));
+    return {mode: mode, rows: rows, best: rows[0].metrics, opponentTrios: opponentTrios,
+            game: game, equilibrium: equilibrium};
+  }
+
+  const prior = estimatedOpponentPrior(matrix, opponentTrios);
+  const rows = game.map((values, a) => {
+    const expected = values.reduce((s, v, b) => s + v * prior.probabilities[b], 0);
+    const cvar = lowerTailCVaR(values, prior.probabilities, CVAR_ALPHA);
+    const value = (1 - CVAR_WEIGHT) * expected + CVAR_WEIGHT * cvar;
+    return {a: a, trio: ownTrios[a], value: value, secondary: cvar,
+            expected: expected, cvar: cvar, metrics: standard[a]};
+  }).sort((x, y) => (y.value - x.value) || (y.cvar - x.cvar) || (y.expected - x.expected));
+  return {mode: "bayes", rows: rows, best: rows[0].metrics, opponentTrios: opponentTrios,
+          game: game, prior: prior};
+}
+
 /* ---------------- パーティの強さ測定 ---------------- */
 const BULK = 200;                      // 測定モードの試行予算（軽めにする）
 const ALLT = () => NAMES.map(n => ({name: n, mega: !!HASMEGA[n]}));
+const ALLF = () => {
+  const out = [];
+  NAMES.forEach(n => {
+    out.push({name: n, mega: false});
+    if (HASMEGA[n]) out.push({name: n, mega: true});
+  });
+  return out;
+};
 
 /* 画面を固まらせないように、60msごとに区切って進める */
 function chunk(tasks, rng, budget, btn, label, done) {
@@ -2601,11 +2820,12 @@ function measure() {
   setMsg("");
   const btn = document.getElementById("power");
   const targets = ALLT();
+  const hardTargets = ALLF();
   const tasks = [];
-  party.forEach(m => tasks.push.apply(tasks, memberTasks(m, targets)));
+  party.forEach(m => tasks.push.apply(tasks, memberTasks(m, hardTargets)));
   const rng = new BAT.RNG((Date.now() ^ 0x5f3a) & 0x7fffffff);
   chunk(tasks, rng, BULK, btn, "測定中…", () => {
-    btn.disabled = false; btn.textContent = "パーティの強さを測定"; showPower(targets);
+    btn.disabled = false; btn.textContent = "パーティの強さを測定"; showPower(targets, hardTargets);
   });
 }
 
@@ -2615,7 +2835,72 @@ function tile(label, v, n, note, warn) {
     '<span class="tn">' + note + '</span></div>';
 }
 
-function showPower(targets) {
+/* 141候補から相手3体を直接全探索するミニマックス。
+   min_J max_I U(I, J) を求め、その厳しい3体を核に相手6体を構成する。 */
+function hardestOpponentAnalysis(targets) {
+  const matrix = payoffMatrix(party, targets, rateOf);
+  const profiles = legalTrios(party).map(trio => selectionProfile(matrix, trio));
+  const n = targets.length;
+  let hardest = null;
+
+  // C(141, 3) を配列化せず走査し、スマホでのメモリ消費を抑える。
+  for (let a = 0; a < n - 2; a++) for (let b = a + 1; b < n - 1; b++) {
+    if (targets[a].name === targets[b].name) continue;
+    const megaAB = (targets[a].mega ? 1 : 0) + (targets[b].mega ? 1 : 0);
+    if (megaAB > 1) continue;
+    for (let c = b + 1; c < n; c++) {
+      if (targets[c].name === targets[a].name || targets[c].name === targets[b].name) continue;
+      if (megaAB + (targets[c].mega ? 1 : 0) > 1) continue;
+
+      let replyScore = -Infinity, replyWorst = -Infinity, replyCover = -Infinity;
+      let replySolid = -Infinity, replyTrio = null;
+      for (const p of profiles) {
+        const ba = p.best[a], bb = p.best[b], bc = p.best[c];
+        const cover = (ba + bb + bc) / 3;
+        const worst = Math.min(ba, bb, bc);
+        const solid = (p.avg[a] + p.avg[b] + p.avg[c]) / 3;
+        const score = SELECT_WEIGHT.cover * cover + SELECT_WEIGHT.worst * worst + SELECT_WEIGHT.solid * solid;
+        if (score > replyScore || (score === replyScore &&
+            (worst > replyWorst || (worst === replyWorst &&
+              (cover > replyCover || (cover === replyCover && solid > replySolid)))))) {
+          replyScore = score; replyWorst = worst; replyCover = cover;
+          replySolid = solid; replyTrio = p.trio;
+        }
+      }
+      if (!replyTrio) continue;
+      if (!hardest || replyScore < hardest.reply.score || (replyScore === hardest.reply.score &&
+          (replyWorst < hardest.reply.worst || (replyWorst === hardest.reply.worst &&
+            (replyCover < hardest.reply.cover ||
+              (replyCover === hardest.reply.cover && replySolid < hardest.reply.solid)))))) {
+        hardest = {columns: [a, b, c], reply: {trio: replyTrio, score: replyScore,
+          worst: replyWorst, cover: replyCover, solid: replySolid}};
+      }
+    }
+  }
+
+  // 単独相手の評価は J={j} とした同じ目的関数（0.7×最大＋0.3×平均）。
+  const individual = targets.map((t, j) => {
+    const rs = matrix.map(row => row[j]);
+    const cover = Math.max.apply(null, rs), avg = mean(rs);
+    return {j: j, t: t, cover: cover, avg: avg,
+            score: (SELECT_WEIGHT.cover + SELECT_WEIGHT.worst) * cover + SELECT_WEIGHT.solid * avg};
+  }).sort((x, y) => (x.score - y.score) || (x.cover - y.cover));
+
+  const chosen = hardest ? hardest.columns.slice() : [];
+  const species = new Set(chosen.map(j => targets[j].name));
+  let megas = chosen.filter(j => targets[j].mega).length;
+  for (const x of individual) {
+    if (chosen.length === 6) break;
+    if (species.has(x.t.name) || (x.t.mega && megas >= 2)) continue;
+    chosen.push(x.j); species.add(x.t.name);
+    if (x.t.mega) megas++;
+  }
+  const byIndex = new Map(individual.map(x => [x.j, x]));
+  return {hard: chosen.map(j => byIndex.get(j)),
+          pick: hardest ? {targets: hardest.columns.map(j => targets[j]), reply: hardest.reply} : null};
+}
+
+function showPower(targets, hardTargets) {
   const rows = party.map(m => {
     const rs = targets.map(t => rateOf(m, t));
     const pair = targets.map((t, i) => [rs[i], ENG.formOf(SPD[t.name], t.mega).label])
@@ -2654,6 +2939,32 @@ function showPower(targets) {
        (holes.length ? holes.map(x => esc(x[1]) + " " + x[0].toFixed(0) + "%").join("、") : "なし") + "</p>";
   h += '<p class="hint">「有利」は勝率55%超、「不利」は45%未満の相手の数です。' +
        "測定は試行数を抑えているため、個別の数値は選出計算よりわずかにブレます。</p></div>";
+
+  const adversary = hardestOpponentAnalysis(hardTargets || targets);
+  const hard = adversary.hard, pick = adversary.pick;
+  h += '<div class="card"><h2>最も勝てない相手パーティ<span class="sub">上位100体から構成</span></h2>' +
+       '<p class="hint">通常・メガを合わせた全候補から、こちらの最善応戦でも評価が最小になる3体を厳密探索し、' +
+       '個別対面が厳しい3体を加えたパーティです。メガシンカはパーティ内2体、選出内1体までに制限しています。</p><div class="pick" style="margin-top:8px">';
+  const picked = new Set(pick ? pick.targets.map(t => t.name + "|" + (t.mega ? 1 : 0)) : []);
+  hard.forEach(x => {
+    const isPick = picked.has(x.t.name + "|" + (x.t.mega ? 1 : 0));
+    h += '<div class="p"><b>' + (isPick ? '<span class="lead">選出</span>' : '') + esc(labelOfFoe(x.t)) + '</b>' +
+      '<div>最善の味方でも ' + x.cover.toFixed(1) + '%</div>' +
+      '<div>味方6体の平均 ' + x.avg.toFixed(1) + '%</div></div>';
+  });
+  h += '</div>';
+  if (pick) {
+    const enemy = pick.targets.map(labelOfFoe);
+    const reply = pick.reply.trio.map(i => labelOf(party[i]));
+    h += '<div style="margin-top:10px"><p class="kv ng"><b>最も厳しい3体選出:</b> ' +
+      enemy.map(esc).join(' ＋ ') + '</p>' +
+      '<p class="kv"><b>こちらの最善応戦:</b> ' + reply.map(esc).join(' ＋ ') + '</p>' +
+      '<p class="kv">対抗評価 ' + pick.reply.score.toFixed(1) +
+      ' / 各相手への最高勝率平均 ' + pick.reply.cover.toFixed(1) +
+      '% / 最低 ' + pick.reply.worst.toFixed(1) + '%</p></div>';
+  }
+  h += '<p class="hint">最悪3体は、相手候補の全組み合わせとこちらの合法な全選出を比較した ' +
+       'min（相手選出）–max（こちらの応戦）の結果です。</p></div>';
   document.getElementById("power_out").innerHTML = h;
   document.getElementById("power_out").scrollIntoView({behavior: "smooth", block: "start"});
 }
@@ -2667,18 +2978,18 @@ const NTOP = 4;        // 精査にかける候補数
 const MINGAIN = 0.5;   // これ未満の改善は誤差とみなす
 let PLANS = [];
 
-const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
 const coverOf = (mem, targets) => targets.map(t => Math.max.apply(null, mem.map(m => rateOf(m, t))));
 
 function suggest() {
   if (!renderParty()) { setMsg("自分のパーティの設定を確認してください"); return; }
   setMsg("");
   const btn = document.getElementById("sug");
+  const keepMega = !!document.getElementById("keepmega").checked;
   const targets = ALLT();
   const rng = new BAT.RNG((Date.now() ^ 0x2c9f) & 0x7fffffff);
   const t1 = [];
   party.forEach(m => t1.push.apply(t1, memberTasks(m, targets)));
-  chunk(t1, rng, BULK, btn, "現状を測定中…", () => sugScreen(targets, rng, btn));
+  chunk(t1, rng, BULK, btn, "現状を測定中…", () => sugScreen(targets, rng, btn, keepMega));
 }
 
 /* 狙う相手を2通りの見方で選ぶ
@@ -2693,7 +3004,7 @@ function favorCount(targets, R) {
   return targets.map((t, i) => R.filter(r => r[i] > FAVOR).length);
 }
 
-function sugScreen(targets, rng, btn) {
+function sugScreen(targets, rng, btn, keepMega) {
   const R = memberRates(targets);
   const cov = coverOf(party, targets);
   const cnt = favorCount(targets, R);
@@ -2706,7 +3017,7 @@ function sugScreen(targets, rng, btn) {
   NAMES.forEach(n => {
     if (have.has(n)) return;
     cands.push(defaultBuild(n, false));
-    if (HASMEGA[n]) cands.push(defaultBuild(n, true));
+    if (!keepMega && HASMEGA[n]) cands.push(defaultBuild(n, true));
   });
   // 両方の狙い先をまとめて1回で絞り込む（重複は SCR のキャッシュが吸収する）
   const seen = {}, wt = [];
@@ -2717,11 +3028,11 @@ function sugScreen(targets, rng, btn) {
   const tasks = [];
   cands.forEach(c => tasks.push.apply(tasks, memberTasks(c, wt, SCR, SCRVAR)));
   chunk(tasks, rng, SCRBUDGET, btn, "候補を絞り込み中…",
-        () => sugFull(targets, R, cov, cnt, weakA, weakB, cands, rng, btn));
+        () => sugFull(targets, R, cov, cnt, weakA, weakB, cands, rng, btn, keepMega));
 }
 
 /* 見込みのある候補だけ、上位100体すべてを本来の精度で測り直す */
-function sugFull(targets, R, cov, cnt, weakA, weakB, cands, rng, btn) {
+function sugFull(targets, R, cov, cnt, weakA, weakB, cands, rng, btn, keepMega) {
   cands.forEach(c => {
     let ga = 0, gb = 0;
     weakA.forEach(x => { const r = rateIn(SCR, c, x.t); if (r > x.cur) ga += r - x.cur; });
@@ -2739,7 +3050,7 @@ function sugFull(targets, R, cov, cnt, weakA, weakB, cands, rng, btn) {
   const tasks = [];
   top.forEach(c => tasks.push.apply(tasks, memberTasks(c, targets)));
   chunk(tasks, rng, BULK, btn, "有力候補を精査中…",
-        () => showSuggest(targets, cov, cnt, topA, topB, btn));
+        () => showSuggest(targets, cov, cnt, topA, topB, btn, keepMega));
 }
 
 /* 候補cをj番目と入れ替えたときの各指標 */
@@ -2763,15 +3074,16 @@ function planOf(c, j, targets, cov, cnt) {
           dupItem: new Set(items).size !== items.length};
 }
 
-function bestPlans(top, targets, cov, cnt, better) {
+function bestPlans(top, targets, cov, cnt, better, keepMega) {
   const out = [];
   top.forEach(c => {
     let best = null;
     for (let j = 0; j < 6; j++) {
+      if (keepMega && party[j].mega) continue;
       const p = planOf(c, j, targets, cov, cnt);
       if (!best || better(p, best)) best = p;
     }
-    out.push(best);
+    if (best) out.push(best);
   });
   out.sort((a, b) => (better(a, b) ? -1 : better(b, a) ? 1 : 0));
   return out;
@@ -2791,19 +3103,20 @@ function warnRows(plans) {
 const cut = (a, n) => a.length ? esc(a.slice(0, n).join("、")) +
   (a.length > n ? " 他" + (a.length - n) + "体" : "") : "―";
 
-function showSuggest(targets, cov, cnt, topA, topB, btn) {
+function showSuggest(targets, cov, cnt, topA, topB, btn, keepMega) {
   btn.disabled = false; btn.textContent = "パーティの改善案";
   const base = {cover: mean(cov), holes: cov.filter(v => v < 50).length,
                 zero: cnt.filter(v => v === 0).length, one: cnt.filter(v => v === 1).length};
-  const plansA = bestPlans(topA, targets, cov, cnt, (p, q) => p.cover > q.cover);
+  const plansA = bestPlans(topA, targets, cov, cnt, (p, q) => p.cover > q.cover, keepMega);
   const plansB = bestPlans(topB, targets, cov, cnt,
     (p, q) => (p.zero !== q.zero) ? p.zero < q.zero :
-              (p.one !== q.one) ? p.one < q.one : p.cover > q.cover);
+              (p.one !== q.one) ? p.one < q.one : p.cover > q.cover, keepMega);
   PLANS = plansA.concat(plansB);
 
   /* --- ① 面を広げる（従来の対応力ベース） --- */
   let h = '<div class="card"><h2>改善案①　面を広げる' +
     '<span class="sub">対応力 ' + base.cover.toFixed(1) + '% / 勝てない相手 ' + base.holes + '体</span></h2>' +
+    (keepMega ? '<p class="kv ok"><b>メガシンカ枠固定モード:</b> メガ個体は残し、非メガ枠だけを非メガ候補と入れ替えます。</p>' : '') +
     '<p class="hint">相手ごとに「一番いい味方」の勝率を見て、勝てない相手を減らす案です。</p>';
   if (!plansA.filter(p => p.cover >= base.cover + MINGAIN || p.holes < base.holes).length) {
     h += '<p class="kv ok">1体入れ替えて対応力が上がる案は見つかりませんでした。面の広さでは埋まっています。</p>' +
@@ -2849,6 +3162,7 @@ function showSuggest(targets, cov, cnt, topA, topB, btn) {
     h += '<p class="kv ng">' + esc(labelOf(p.c)) + ": 代わりに " + cut(p.lost, 4) + " が有利0体になります</p>";
   });
   h += '<p class="hint">候補は上位100体の使用率1位の型です。入れ替え先の枠は自動で選んでいます。' +
+       (keepMega ? 'メガシンカ枠固定モードでは、現在のメガ個体とその枠を変更しません。' : '') +
        '適用しても保存はされないので、気に入らなければ「クリア」や「推奨パーティに戻す」で戻せます。</p></div>';
 
   const O = document.getElementById("sug_out");
@@ -2888,29 +3202,59 @@ function cellColor(v) {
   return ["#e57373", "#fff"];
 }
 
+function selectionPayoffMatrixHTML(decision) {
+  const game = decision.game, ownTrios = decision.rows
+    .slice().sort((x, y) => x.a - y.a).map(x => x.trio);
+  const opponentTrios = decision.opponentTrios;
+  let h = '<details style="margin-top:8px"><summary>選出利得行列 (' + game.length + '×' +
+    opponentTrios.length + ')</summary>' +
+    '<p class="hint">行Aがこちら、列Bが相手の3体選出です。各セルはその組み合わせに対するU。' +
+    '6体から3体は最大20通りですが、メガ2体以上を含む選出は除外します。</p>' +
+    '<div class="scroll"><table><tr><th class="rowh"></th>';
+  opponentTrios.forEach((trio, b) => {
+    const probability = decision.prior ? '<br><span style="opacity:.7">' +
+      (decision.prior.probabilities[b] * 100).toFixed(1) + '%</span>' : '';
+    h += '<th>B' + (b + 1) + probability + '</th>';
+  });
+  h += '</tr>';
+  game.forEach((values, a) => {
+    h += '<tr><td class="rowh">A' + (a + 1) + '</td>';
+    values.forEach(v => {
+      const c = cellColor(v);
+      h += '<td style="background:' + c[0] + ';color:' + c[1] + '">' + v.toFixed(1) + '</td>';
+    });
+    h += '</tr>';
+  });
+  h += '</table></div><div style="margin-top:8px"><p class="kv"><b>こちら（行）</b></p>';
+  ownTrios.forEach((trio, a) => h += '<p class="kv">A' + (a + 1) + ': ' +
+    trio.map(i => esc(labelOf(party[i]))).join(' ＋ ') + '</p>');
+  h += '<p class="kv"><b>相手（列）</b></p>';
+  opponentTrios.forEach((trio, b) => h += '<p class="kv">B' + (b + 1) + ': ' +
+    trio.map(i => esc(labelOfFoe(foes[i]))).join(' ＋ ') + '</p>');
+  return h + '</div></details>';
+}
+
 function showResult() {
   const O = document.getElementById("out");
-  const res = [];
-  for (const trio of combos3([0, 1, 2, 3, 4, 5])) {
-    if (trio.filter(i => party[i].mega).length > 1) continue;
-    const bests = foes.map(f => Math.max.apply(null, trio.map(i => rateSel(party[i], f))));
-    const cover = bests.reduce((s, v) => s + v, 0) / 6, worst = Math.min.apply(null, bests);
-    let sum = 0;
-    trio.forEach(i => foes.forEach(f => sum += rateSel(party[i], f)));
-    const solid = sum / 18;
-    res.push({trio: trio, cover: cover, worst: worst, solid: solid,
-              score: .5 * cover + .2 * worst + .3 * solid});
-  }
-  if (!res.length) { O.innerHTML = '<div class="card"><p class="msg">メガ1体以下の3体組が作れません</p></div>'; return; }
-  res.sort((a, b) => b.score - a.score);
-  const best = res[0];
+  const mode = currentCalcMode();
+  const matrix = payoffMatrix(party, foes, rateSel);
+  const decision = selectionDecision(mode, party, foes, matrix);
+  if (!decision) { O.innerHTML = '<div class="card"><p class="msg">メガ1体以下の3体組が作れません</p></div>'; return; }
+  const rows = decision.rows, best = decision.best;
   const lead = best.trio.slice().sort((x, y) => {
     const f = i => { const r = foes.map(f2 => rateSel(party[i], f2)); return (r.reduce((s, v) => s + v, 0) / 6 + Math.min.apply(null, r)) / 2; };
     return f(y) - f(x);
   })[0];
   const order = [lead].concat(best.trio.filter(i => i !== lead));
 
-  let h = '<div class="card"><h2>推奨選出<span class="sub">スコア ' + best.score.toFixed(1) + '</span></h2><div class="pick">';
+  const title = {standard: "推奨選出", maximin: "Maximin推奨選出",
+                 nash: "Nash均衡の代表選出", bayes: "ベイズ＋CVaR推奨選出"}[mode];
+  const headline = mode === "standard" ? "スコア " + best.score.toFixed(1) :
+    mode === "maximin" ? "保証値 " + rows[0].value.toFixed(1) :
+    mode === "nash" ? "均衡値 " + decision.equilibrium.value.toFixed(1) :
+    "総合値 " + rows[0].value.toFixed(1);
+  let h = '<div class="card"><h2>' + title + '<span class="sub">' + headline + '</span></h2>' +
+    '<p class="hint">' + esc(CALC_MODE_DESC[mode]) + '</p><div class="pick">';
   order.forEach((i, k) => {
     const m = party[i], rs = foes.map(f => rateSel(m, f));
     h += '<div class="p"><b>' + (k === 0 ? '<span class="lead">先発</span>' : "") + esc(labelOf(m)) + '</b>' +
@@ -2920,6 +3264,35 @@ function showResult() {
       '% / 有利 ' + rs.filter(v => v > 55).length + '体</div></div>';
   });
   h += "</div>";
+  if (mode === "maximin") {
+    h += '<p class="kv"><b>最も不利な相手選出:</b> ' + rows[0].worstOpponent
+      .map(i => esc(labelOfFoe(foes[i]))).join(' ＋ ') + '</p>' +
+      '<p class="kv">最悪時 ' + rows[0].value.toFixed(1) + ' / 相手20通り平均 ' +
+      rows[0].secondary.toFixed(1) + '</p>';
+  } else if (mode === "nash") {
+    const ownMix = rows.filter(r => r.probability >= .005).slice(0, 6);
+    const oppMix = decision.equilibrium.col.map((probability, b) => ({probability: probability, trio: decision.opponentTrios[b]}))
+      .sort((x, y) => y.probability - x.probability).filter(r => r.probability >= .005).slice(0, 4);
+    h += '<div style="margin-top:8px"><p class="kv"><b>こちらの混合戦略</b></p>';
+    ownMix.forEach(r => h += '<p class="kv">' + (r.probability * 100).toFixed(1) + '%　' +
+      r.trio.map(i => esc(labelOf(party[i]))).join(' ＋ ') + '</p>');
+    h += '<p class="kv"><b>相手側の均衡上位</b></p>';
+    oppMix.forEach(r => h += '<p class="kv">' + (r.probability * 100).toFixed(1) + '%　' +
+      r.trio.map(i => esc(labelOfFoe(foes[i]))).join(' ＋ ') + '</p>');
+    h += '<p class="hint">保証下限 ' + decision.equilibrium.lower.toFixed(2) +
+      ' / 上限 ' + decision.equilibrium.upper.toFixed(2) + ' / 近似誤差 ' +
+      decision.equilibrium.exploitability.toFixed(2) + '</p></div>';
+  } else if (mode === "bayes") {
+    const likely = decision.prior.probabilities.map((probability, b) => ({probability: probability, trio: decision.opponentTrios[b]}))
+      .sort((x, y) => y.probability - x.probability).slice(0, 3);
+    h += '<div style="margin-top:8px"><p class="kv"><b>期待値 ' + rows[0].expected.toFixed(1) +
+      ' / 下側20% CVaR ' + rows[0].cvar.toFixed(1) + '</b></p>' +
+      '<p class="kv"><b>選出確率が高いと推定した相手</b></p>';
+    likely.forEach(r => h += '<p class="kv">' + (r.probability * 100).toFixed(1) + '%　' +
+      r.trio.map(i => esc(labelOfFoe(foes[i]))).join(' ＋ ') + '</p>');
+    h += '<p class="hint">実測の選出率がないため、一様事前分布に相手側の対面評価から得た' +
+      'softmax尤度を掛けて正規化したモデル推定確率です。</p></div>' + selectionPayoffMatrixHTML(decision);
+  }
   h += '<div style="margin-top:8px">';
   best.trio.forEach(i => {
     const tgt = foes.filter(f => Math.max.apply(null, best.trio.map(j => rateSel(party[j], f))) === rateSel(party[i], f))
@@ -2929,9 +3302,12 @@ function showResult() {
   const risk = foes.filter(f => Math.max.apply(null, best.trio.map(i => rateSel(party[i], f))) < 50).map(f => labelOfFoe(f));
   h += '<p class="kv ' + (risk.length ? "ng" : "ok") + '">要注意（3体とも5割未満）: ' + (risk.map(esc).join("、") || "なし") + "</p></div>";
   h += '<details style="margin-top:6px"><summary>次点の選出候補</summary>';
-  res.slice(1, 4).forEach(r => {
-    h += '<p class="kv">' + r.trio.map(i => esc(labelOf(party[i]))).join(" ＋ ") +
-      "　(スコア " + r.score.toFixed(1) + " / 最悪 " + r.worst.toFixed(0) + "%)</p>";
+  rows.slice(1, 4).forEach(r => {
+    const detail = mode === "standard" ? "スコア " + r.value.toFixed(1) + " / 最悪 " + r.secondary.toFixed(0) + "%" :
+      mode === "maximin" ? "保証値 " + r.value.toFixed(1) + " / 平均 " + r.secondary.toFixed(1) :
+      mode === "nash" ? "均衡確率 " + r.value.toFixed(1) + "% / 単独保証 " + r.secondary.toFixed(1) :
+      "総合値 " + r.value.toFixed(1) + " / 下側CVaR " + r.secondary.toFixed(1);
+    h += '<p class="kv">' + r.trio.map(i => esc(labelOf(party[i]))).join(" ＋ ") + "　(" + detail + ")</p>";
   });
   h += "</details></div>";
 
@@ -2995,6 +3371,6 @@ if (!document.querySelector("meta[name=viewport]")) {
   document.head.appendChild(mv);
 }
 ENG.init(DATA); VAR.init(DATA);
-renderFoes(); renderParty();
+renderFoes(); renderParty(); updateCalcMode();
 
 </script>
