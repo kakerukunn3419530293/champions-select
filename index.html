@@ -114,8 +114,8 @@ details summary{font-size:13px;cursor:pointer;color:var(--accent);padding:4px 0}
         <select id="calc_mode" onchange="updateCalcMode()">
           <option value="standard">既存の総合評価</option>
           <option value="maximin">純戦略Maximin</option>
-          <option value="nash">混合戦略Nash均衡（近似）</option>
-          <option value="bayes">選出利得行列＋ベイズ期待値＋下側CVaR</option>
+          <option value="nash">混合戦略Nash均衡（厳密LP）</option>
+          <option value="bayes">隠れ型ベイズゲーム＋下側CVaR</option>
         </select>
       </label>
     </div>
@@ -153,8 +153,9 @@ details summary{font-size:13px;cursor:pointer;color:var(--accent);padding:4px 0}
 
       <p><b>相手の型の想定</b><br>
       技は採用率上位6技から4技を選ぶ15通り、持ち物は上位3種、能力ポイント配分は上位3種、
-      性格は上位2種。これらを採用率で重み付けし、確率の高い順に累積99.5%まで使います
-      （1体あたり中央値107型）。</p>
+      性格は上位2種、特性は上位3種。これらを採用率で重み付けし、確率の高い順に累積99.5%まで使います
+      （1体あたり中央値230型）。Nash・ベイズでは、相手6体の型を128組の準モンテカルロ標本として保持し、
+      型を知る相手の3体選出と結合して評価します。</p>
 
       <p><b>計算の前提</b></p>
       <ul>
@@ -170,8 +171,8 @@ details summary{font-size:13px;cursor:pointer;color:var(--accent);padding:4px 0}
       「既存の総合評価」は従来どおり相手6体全体へのUを最大化します。</p>
       <ul>
         <li>純戦略Maximin: 相手の全選出に対するUの最小値を最大化</li>
-        <li>混合戦略Nash均衡: 最大20×20の選出利得行列をMultiplicative Weightsで近似</li>
-        <li>ベイズ＋下側CVaR: 一様事前分布と相手側Uから選出確率を推定し、期待値75%＋下側20% CVaR 25%を最大化</li>
+        <li>混合戦略Nash均衡: 型で条件付けした最大20×20の選出利得行列を線形計画法で厳密に解く</li>
+        <li>隠れ型ベイズ＋下側CVaR: 持ち物・性格・特性・技・努力値・選出の共同シナリオを評価し、期待値75%＋下側20% CVaR 25%を最大化</li>
       </ul>
       <p class="hint">6体から3体の組は最大20通りです。メガシンカを2体以上含む選出は除外するため、
       メガ枠が複数あるパーティでは利得行列が20×20未満になる場合があります。</p>
@@ -782,7 +783,7 @@ return {init, Mon, Field, damageRolls, critChance, realStats, clearCache, megaFo
 })();
 
 /* 相手側の型生成（variants2.py の移植）
-   技上位6→4技の15通り × 持ち物3 × 配分3 × 性格2 を採用率で重み付けし、
+   技上位6→4技の15通り × 持ち物3 × 配分3 × 性格2 × 特性を採用率で重み付けし、
    累積99.5%まで採用する。 */
 "use strict";
 
@@ -817,13 +818,19 @@ function combinations(n, k) {
 function buildsOf(name, mega, opt) {
   opt = opt || {};
   const nMove = opt.nMove || 6, nItem = opt.nItem || 3;
-  const nSpread = opt.nSpread || 3, nNature = opt.nNature || 2;
+  const nSpread = opt.nSpread || 3, nNature = opt.nNature || 2, nAbility = opt.nAbility || 3;
   const keep = opt.keep || 0.995;
   const v = SP[name];
   const megaSuffix = opt.megaSuffix || "";
   const mk = mega ? E.megaFormKey(v, megaSuffix) : null;
   const form = v.forms[mk || v.key];
-  const ability = mk ? form.abilities[0] : v.abilities[0][0];
+  let abilities;
+  if (mk) abilities = [[form.abilities[0], 1.0]];
+  else {
+    const ab = v.abilities.slice(0, nAbility);
+    const ta = ab.reduce((s, x) => s + x[1], 0) || 1;
+    abilities = ab.map(x => [x[0], x[1] / ta]);
+  }
 
   const mv = v.moves.slice(0, nMove).map(x => [x[0], Math.min(0.995, Math.max(0.005, x[1] / 100))]);
   let msets;
@@ -862,7 +869,9 @@ function buildsOf(name, mega, opt) {
         let ok = nats.filter(x => compat(s, x[0]));
         if (!ok.length) ok = [[nats[0][0], 1.0]];
         const tk = ok.reduce((a, x) => a + x[1], 0) || 1;
-        for (const [nt, wn] of ok) combos.push([wm * wi * ws * wn / tk, ms, it, s, nt]);
+        for (const [nt, wn] of ok)
+          for (const [ability, wa] of abilities)
+            combos.push([wm * wi * ws * wn * wa / tk, ms, it, s, nt, ability]);
       }
   combos.sort((a, b) => b[0] - a[0]);
   const tot = combos.reduce((s, x) => s + x[0], 0) || 1;
@@ -874,7 +883,7 @@ function buildsOf(name, mega, opt) {
     build: {
       uid: name + "|" + (mk ? 1 : 0) + (megaSuffix || "") + "|" + i,
       name: name, label: form.label, mega: !!mk, types: form.types, weight: form.weight,
-      base: form.base, ability: ability, nature: c[4], item: c[2], points: c[3], moves: c[1],
+      base: form.base, ability: c[5], nature: c[4], item: c[2], points: c[3], moves: c[1],
     },
     w: c[0] / s2,
     cover: cover,
@@ -2560,17 +2569,19 @@ function targetKey(f) {
 /* 選出計算もShowdown同様、追加効果・ひるみ・こんらん・確率急所を確率込みで測る。
    測定・改善案とはキャッシュ用途が異なるので、入れ物を RATE と分ける。 */
 const RATE_SEL = {};
+const RATE_SEL_TYPES = {};             // 対面平均前の相手型別勝率
 function rowTask(m, oppName, oppMega, megaSuffix) {
   const sig = sigOf(m), target = {name: oppName, mega: oppMega, megaSuffix: megaSuffix || ""};
   const key = targetKey(target);
   const ck = sig + "@" + key;
-  if (RATE_SEL[ck] !== undefined) return null;
+  if (RATE_SEL[ck] !== undefined && RATE_SEL_TYPES[ck] !== undefined) return null;
   return {ck: ck, build: engBuild(m, "my:" + sig), vs: VAR.opponent(oppName, oppMega, megaSuffix),
-          store: RATE_SEL, noLuck: false};
+          store: RATE_SEL, typeStore: RATE_SEL_TYPES, noLuck: false};
 }
 
 function runTask(t, rng, budget) {
   const S = t.store || RATE;
+  const typeRates = t.typeStore ? {} : null;
   let tot = 0;
   for (const {build, w} of t.vs) {
     const n = Math.max(1, Math.min(NMAX, Math.round((budget || BUDGET) * w)));
@@ -2580,9 +2591,12 @@ function runTask(t, rng, budget) {
       if (res === "A") win += 1;
       else if (res === "D" || res === "T") win += 0.5;
     }
-    tot += w * win / n;
+    const rate = win / n;
+    tot += w * rate;
+    if (typeRates) typeRates[build.uid] = Math.round(rate * 1000) / 10;
   }
   S[t.ck] = Math.round(tot * 1000) / 10;
+  if (typeRates) t.typeStore[t.ck] = typeRates;
 }
 
 function compute() {
@@ -2627,6 +2641,21 @@ function rateSel(m, f) {   // 選出計算用
   return v === undefined ? 50 : v;
 }
 
+function rateSelByOpponentType(m, f, build) {
+  const byType = RATE_SEL_TYPES[sigOf(m) + "@" + targetKey(f)];
+  const v = byType && byType[build.uid];
+  return v === undefined ? rateSel(m, f) : v;
+}
+
+/* 各相手について、持ち物・性格・特性・技・配分を保持した離散的な隠れ型分布を作る。 */
+function hiddenOpponentTypeDistributions(members, opponents) {
+  return opponents.map(f => VAR.opponent(f.name, f.mega, f.megaSuffix).map(v => ({
+    build: v.build,
+    w: v.w,
+    rates: members.map(m => rateSelByOpponentType(m, f, v.build)),
+  })));
+}
+
 /* ---------------- 選出最適化 ----------------
    勝率行列 P[i][j]（味方 i 対 相手 j）を作り、選出 I の評価を
      C(I) = mean_j max_{i∈I} P[i][j]       対応範囲
@@ -2634,16 +2663,40 @@ function rateSel(m, f) {   // 選出計算用
      S(I) = mean_{i∈I,j} P[i][j]           選出の厚み
      U(I) = 0.5 C(I) + 0.2 W(I) + 0.3 S(I)
    として最大化する。通常選出と苦手選出で同じ定義を共有する。 */
-const SELECT_WEIGHT = Object.freeze({cover: .5, worst: .2, solid: .3});
+const SELECTION_RULES = Object.freeze({
+  pickCount: 3,
+  maxMega: 1,
+  weights: Object.freeze({cover: .5, worst: .2, solid: .3}),
+  bayesBeta: .08,
+  cvarAlpha: .20,
+  cvarWeight: .25,
+  typeSamples: 128,
+  lpTolerance: 1e-10,
+  lpMaxPivots: 10000,
+});
 const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+
+function enumerateCombinations(values, count) {
+  const out = [], chosen = [];
+  (function visit(start) {
+    if (chosen.length === count) { out.push(chosen.slice()); return; }
+    const remaining = count - chosen.length;
+    for (let i = start; i <= values.length - remaining; i++) {
+      chosen.push(values[i]);
+      visit(i + 1);
+      chosen.pop();
+    }
+  })(0);
+  return out;
+}
 
 function payoffMatrix(members, targets, rateFn) {
   return members.map(m => targets.map(t => rateFn(m, t)));
 }
 
 function legalTrios(members) {
-  return combos3(members.map((m, i) => i))
-    .filter(trio => trio.filter(i => members[i].mega).length <= 1);
+  return enumerateCombinations(members.map((m, i) => i), SELECTION_RULES.pickCount)
+    .filter(trio => trio.filter(i => members[i].mega).length <= SELECTION_RULES.maxMega);
 }
 
 /* 1つの味方選出について、相手1体ごとの最大勝率と平均勝率を前計算する。 */
@@ -2658,7 +2711,13 @@ function selectionProfile(matrix, trio) {
   return {trio: trio, best: best, avg: avg};
 }
 
-function profileMetrics(profile, columns) {
+/* 全モードが共有する選出効用。detailed=false なら行列生成向けに数値だけ返す。 */
+function selectionUtility(cover, worst, solid) {
+  const w = SELECTION_RULES.weights;
+  return w.cover * cover + w.worst * worst + w.solid * solid;
+}
+
+function evaluateSelectionProfile(profile, columns, detailed) {
   let cover = 0, worst = Infinity, solid = 0;
   for (const j of columns) {
     const b = profile.best[j];
@@ -2668,8 +2727,16 @@ function profileMetrics(profile, columns) {
   }
   cover /= columns.length;
   solid /= columns.length;
-  return {trio: profile.trio, cover: cover, worst: worst, solid: solid,
-          score: SELECT_WEIGHT.cover * cover + SELECT_WEIGHT.worst * worst + SELECT_WEIGHT.solid * solid};
+  const score = selectionUtility(cover, worst, solid);
+  return detailed ? {trio: profile.trio, cover: cover, worst: worst, solid: solid, score: score} : score;
+}
+
+function profileMetrics(profile, columns) {
+  return evaluateSelectionProfile(profile, columns, true);
+}
+
+function profileScore(profile, columns) {
+  return evaluateSelectionProfile(profile, columns, false);
 }
 
 function compareMetrics(a, b) {
@@ -2677,17 +2744,12 @@ function compareMetrics(a, b) {
     (b.cover - a.cover) || (b.solid - a.solid);
 }
 
-function rankSelectionProfiles(profiles, columns) {
-  return profiles.map(p => profileMetrics(p, columns)).sort(compareMetrics);
-}
-
 const CALC_MODE_DESC = {
   standard: "既存方式: 相手6体への対応範囲50%・最悪対面20%・選出の厚み30%で評価します。",
   maximin: "相手の合法な3体選出すべてを想定し、最悪の場合の評価が最も高い1組を選びます。",
-  nash: "双方の最大20通りをゼロ和ゲームとして解き、読まれにくい選出確率を求めます。",
-  bayes: "最大20×20の選出利得行列を作り、推定選出確率での期待値75%・下側20% CVaR 25%で評価します。",
+  nash: "相手の隠れ型で条件付けした最大20×20行列を線形計画法で厳密に解き、読まれにくい選出確率を求めます。",
+  bayes: "持ち物・性格・特性・技・努力値・3体選出を共同分布にし、期待値75%・下側20% CVaR 25%で評価します。",
 };
-const BAYES_BETA = .08, CVAR_ALPHA = .20, CVAR_WEIGHT = .25;
 
 function currentCalcMode() {
   const e = document.getElementById("calc_mode");
@@ -2704,44 +2766,179 @@ function updateCalcMode() {
 function selectionGameMatrix(profiles, opponentTrios) {
   return profiles.map(p => opponentTrios.map(cols => profileScore(p, cols)));
 }
-function profileScore(profile, columns) {
-  let cover = 0, worst = Infinity, solid = 0;
-  for (const j of columns) {
-    const b = profile.best[j];
-    cover += b;
-    if (b < worst) worst = b;
-    solid += profile.avg[j];
-  }
-  cover /= columns.length; solid /= columns.length;
-  return SELECT_WEIGHT.cover * cover + SELECT_WEIGHT.worst * worst + SELECT_WEIGHT.solid * solid;
-}
-function maximinValue(members, opponents, matrix) {
-  const ownTrios = legalTrios(members), opponentTrios = legalTrios(opponents);
-  if (!ownTrios.length || !opponentTrios.length) return 0;
-  let value = -Infinity;
-  for (const trio of ownTrios) {
-    const profile = selectionProfile(matrix, trio);
-    let guaranteed = Infinity;
-    for (const columns of opponentTrios) guaranteed = Math.min(guaranteed, profileScore(profile, columns));
-    value = Math.max(value, guaranteed);
+
+function radicalInverse(index, base) {
+  let value = 0, place = 1 / base;
+  while (index > 0) {
+    value += (index % base) * place;
+    index = Math.floor(index / base);
+    place /= base;
   }
   return value;
 }
 
-function softmax(values, scale) {
-  const z = values.map(v => v * scale), mx = Math.max.apply(null, z);
-  const ex = z.map(v => Math.exp(v - mx)), sum = ex.reduce((s, v) => s + v, 0) || 1;
-  return ex.map(v => v / sum);
+function preparedTypeDistribution(rows, fallbackRates) {
+  const valid = (rows || []).filter(row => row && row.rates &&
+    row.rates.length === fallbackRates.length && row.rates.every(Number.isFinite) && row.w > 0);
+  if (!valid.length) return [{build: null, rates: fallbackRates, cumulative: 1}];
+  const total = valid.reduce((s, row) => s + row.w, 0) || 1;
+  let cumulative = 0;
+  return valid.map((row, i) => {
+    cumulative += row.w / total;
+    return {build: row.build || null, rates: row.rates, cumulative: i === valid.length - 1 ? 1 : cumulative};
+  });
 }
 
-/* 相手側の強さを 100-P の転置行列で近似し、Gibbs/softmax事前分布にする。 */
-function estimatedOpponentPrior(matrix, opponentTrios) {
-  const enemyMatrix = Array.from({length: matrix[0].length}, (_, j) =>
-    Array.from({length: matrix.length}, (_, i) => 100 - matrix[i][j]));
-  const columns = matrix.map((row, i) => i);
-  const scores = opponentTrios.map(trio =>
-    profileMetrics(selectionProfile(enemyMatrix, trio), columns).score);
-  return {probabilities: softmax(scores, BAYES_BETA), scores: scores};
+function quantileType(distribution, probability) {
+  let lo = 0, hi = distribution.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (probability <= distribution[mid].cumulative) hi = mid;
+    else lo = mid + 1;
+  }
+  return distribution[lo];
+}
+
+function typedSelectionScore(ownTrio, selectedTypes) {
+  let cover = 0, worst = Infinity, solid = 0;
+  for (const type of selectedTypes) {
+    let best = -Infinity, sum = 0;
+    for (const i of ownTrio) {
+      const rate = type.rates[i];
+      if (rate > best) best = rate;
+      sum += rate;
+    }
+    cover += best;
+    if (best < worst) worst = best;
+    solid += sum / ownTrio.length;
+  }
+  return selectionUtility(cover / selectedTypes.length, worst, solid / selectedTypes.length);
+}
+
+/* 相手から見た選出効用。100-Pで転置し、相手が自分の6体へ対応する強さを測る。 */
+function typedOpponentSelectionScore(selectedTypes, memberCount) {
+  let cover = 0, worst = Infinity, solid = 0;
+  for (let i = 0; i < memberCount; i++) {
+    let best = -Infinity, sum = 0;
+    for (const type of selectedTypes) {
+      const rate = 100 - type.rates[i];
+      if (rate > best) best = rate;
+      sum += rate;
+    }
+    cover += best;
+    if (best < worst) worst = best;
+    solid += sum / selectedTypes.length;
+  }
+  return selectionUtility(cover / memberCount, worst, solid / memberCount);
+}
+
+/*
+  Natureが相手6体の型を準乱数で標本化し、その型を知る相手がsoftmaxで3体を選ぶ
+  Harsanyi変換後の共同シナリオを作る。型と選出を先に平均しないため、両者の相関を保持できる。
+*/
+function createBayesianSelectionGame(model) {
+  const memberCount = model.members.length;
+  const hasTypes = Array.isArray(model.typeDistributions) &&
+    model.typeDistributions.length === model.opponents.length;
+  const distributions = model.opponents.map((_, j) => preparedTypeDistribution(
+    hasTypes ? model.typeDistributions[j] : null,
+    model.matrix.map(row => row[j])));
+  const sampleCount = hasTypes ? SELECTION_RULES.typeSamples : 1;
+  const primes = [2, 3, 5, 7, 11, 13, 17, 19];
+  const scenarios = [];
+  const selectionProbabilities = new Float64Array(model.opponentTrios.length);
+  const scoreSums = new Float64Array(model.opponentTrios.length);
+
+  for (let sample = 0; sample < sampleCount; sample++) {
+    const partyTypes = distributions.map((distribution, j) =>
+      quantileType(distribution, hasTypes ? radicalInverse(sample + 1, primes[j]) : .5));
+    const selectedByTrio = model.opponentTrios.map(trio => trio.map(j => partyTypes[j]));
+    const scores = selectedByTrio.map(types => typedOpponentSelectionScore(types, memberCount));
+    const selectionGivenType = softmax(scores, SELECTION_RULES.bayesBeta);
+
+    for (let b = 0; b < model.opponentTrios.length; b++) {
+      const probability = selectionGivenType[b] / sampleCount;
+      const values = model.ownTrios.map(trio => typedSelectionScore(trio, selectedByTrio[b]));
+      scenarios.push({opponentIndex: b, probability: probability, values: values,
+        builds: selectedByTrio[b].map(type => type.build), selectionScore: scores[b]});
+      selectionProbabilities[b] += probability;
+      scoreSums[b] += scores[b] / sampleCount;
+    }
+  }
+
+  const game = model.ownTrios.map(() => Array(model.opponentTrios.length).fill(0));
+  for (const scenario of scenarios) {
+    const b = scenario.opponentIndex, denominator = selectionProbabilities[b] || 1;
+    for (let a = 0; a < model.ownTrios.length; a++)
+      game[a][b] += scenario.probability * scenario.values[a] / denominator;
+  }
+  return {game: game, scenarios: scenarios,
+    selectionProbabilities: Array.from(selectionProbabilities), scores: Array.from(scoreSums),
+    sampleCount: sampleCount, typeAware: hasTypes};
+}
+
+function validatePayoffMatrix(matrix, rowCount, columnCount) {
+  if (!Array.isArray(matrix) || matrix.length !== rowCount || matrix.some(row =>
+      !Array.isArray(row) || row.length !== columnCount || row.some(v => !Number.isFinite(v)))) {
+    throw new Error("選出利得行列の形または値が不正です。");
+  }
+}
+
+/* 合法選出と対面プロファイルを1回だけ構築し、評価結果と利得行列は必要時に遅延生成する。 */
+function createSelectionModel(members, opponents, matrix, typeDistributions) {
+  validatePayoffMatrix(matrix, members.length, opponents.length);
+  const ownTrios = legalTrios(members), opponentTrios = legalTrios(opponents);
+  if (!ownTrios.length || !opponentTrios.length) return null;
+  const profiles = ownTrios.map(trio => selectionProfile(matrix, trio));
+  const allColumns = opponents.map((_, i) => i);
+  let standard = null, game = null, bayesianGame = null;
+  return {
+    members: members,
+    opponents: opponents,
+    matrix: matrix,
+    ownTrios: ownTrios,
+    opponentTrios: opponentTrios,
+    profiles: profiles,
+    typeDistributions: typeDistributions || null,
+    getStandard: function() {
+      if (standard === null) standard = profiles.map(p => profileMetrics(p, allColumns));
+      return standard;
+    },
+    getGame: function() {
+      if (game === null) game = selectionGameMatrix(profiles, opponentTrios);
+      return game;
+    },
+    getBayesianGame: function() {
+      if (bayesianGame === null) bayesianGame = createBayesianSelectionGame(this);
+      return bayesianGame;
+    },
+  };
+}
+
+function maximinValue(members, opponents, matrix) {
+  const model = createSelectionModel(members, opponents, matrix);
+  if (!model) return 0;
+  const game = model.getGame();
+  let value = -Infinity;
+  for (const row of game) value = Math.max(value, Math.min.apply(null, row));
+  return value;
+}
+
+function softmaxInto(values, scale, out) {
+  let mx = -Infinity;
+  for (let i = 0; i < values.length; i++) mx = Math.max(mx, values[i] * scale);
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    out[i] = Math.exp(values[i] * scale - mx);
+    sum += out[i];
+  }
+  sum = sum || 1;
+  for (let i = 0; i < values.length; i++) out[i] /= sum;
+  return out;
+}
+
+function softmax(values, scale) {
+  return Array.from(softmaxInto(values, scale, new Float64Array(values.length)));
 }
 
 /* 下側alpha確率質量の加重平均。値が小さいシナリオから確率を切り取る。 */
@@ -2756,79 +2953,163 @@ function lowerTailCVaR(values, probabilities, alpha) {
   return total / Math.max(1e-12, alpha - Math.max(0, left));
 }
 
-/* Multiplicative Weights の平均戦略で有限ゼロ和ゲームのNash均衡を近似する。 */
-function solveZeroSumGame(game, iterations) {
-  const m = game.length, n = game[0].length, T = iterations || 20000;
-  const rowGain = new Float64Array(m), colCost = new Float64Array(n);
-  const sumRow = new Float64Array(m), sumCol = new Float64Array(n);
-  const eta = Math.sqrt(8 * Math.log(Math.max(2, m, n)) / T);
-  for (let t = 0; t < T; t++) {
-    const x = softmax(Array.from(rowGain), eta);
-    const y = softmax(Array.from(colCost), -eta);
-    for (let i = 0; i < m; i++) sumRow[i] += x[i];
-    for (let j = 0; j < n; j++) sumCol[j] += y[j];
-    for (let i = 0; i < m; i++) {
-      let u = 0; for (let j = 0; j < n; j++) u += game[i][j] * y[j] / 100;
-      rowGain[i] += u;
-    }
-    for (let j = 0; j < n; j++) {
-      let u = 0; for (let i = 0; i < m; i++) u += x[i] * game[i][j] / 100;
-      colCost[j] += u;
-    }
+/* max c・x, A・x<=b, x>=0 を主単体法で解く。ここではb=1の常に実行可能なLPだけを渡す。 */
+function simplexMax(A, b, c) {
+  const m = A.length, n = c.length, rhs = n + m;
+  const tableau = Array.from({length: m + 1}, () => new Float64Array(rhs + 1));
+  const basis = new Int32Array(m);
+  for (let i = 0; i < m; i++) {
+    for (let j = 0; j < n; j++) tableau[i][j] = A[i][j];
+    tableau[i][n + i] = 1;
+    tableau[i][rhs] = b[i];
+    basis[i] = n + i;
   }
-  const row = Array.from(sumRow, v => v / T), col = Array.from(sumCol, v => v / T);
+  for (let j = 0; j < n; j++) tableau[m][j] = -c[j];
+
+  let pivots = 0;
+  while (true) {
+    let entering = -1;
+    for (let j = 0; j < rhs; j++) {
+      if (tableau[m][j] < -SELECTION_RULES.lpTolerance) { entering = j; break; }
+    }
+    if (entering < 0) break;
+
+    let leaving = -1, ratio = Infinity;
+    for (let i = 0; i < m; i++) {
+      const coefficient = tableau[i][entering];
+      if (coefficient <= SELECTION_RULES.lpTolerance) continue;
+      const candidate = tableau[i][rhs] / coefficient;
+      if (candidate < ratio - SELECTION_RULES.lpTolerance ||
+          (Math.abs(candidate - ratio) <= SELECTION_RULES.lpTolerance &&
+            (leaving < 0 || basis[i] < basis[leaving]))) {
+        ratio = candidate;
+        leaving = i;
+      }
+    }
+    if (leaving < 0) throw new Error("Nash均衡の線形計画が非有界です。");
+    if (++pivots > SELECTION_RULES.lpMaxPivots)
+      throw new Error("Nash均衡の線形計画が反復上限に達しました。");
+
+    const pivot = tableau[leaving][entering];
+    for (let j = 0; j <= rhs; j++) tableau[leaving][j] /= pivot;
+    for (let i = 0; i <= m; i++) {
+      if (i === leaving) continue;
+      const factor = tableau[i][entering];
+      if (Math.abs(factor) <= SELECTION_RULES.lpTolerance) continue;
+      for (let j = 0; j <= rhs; j++) tableau[i][j] -= factor * tableau[leaving][j];
+    }
+    basis[leaving] = entering;
+  }
+
+  const solution = new Float64Array(n);
+  for (let i = 0; i < m; i++) if (basis[i] < n)
+    solution[basis[i]] = Math.max(0, tableau[i][rhs]);
+  return {solution: Array.from(solution), value: tableau[m][rhs], pivots: pivots};
+}
+
+/* 正の利得行列について、列プレイヤーのminimax戦略をLPの双対形で求める。 */
+function exactColumnStrategy(game) {
+  let minimum = Infinity;
+  for (const row of game) for (const value of row) minimum = Math.min(minimum, value);
+  const shift = minimum <= 0 ? 1 - minimum : 0;
+  const positive = game.map(row => row.map(value => value + shift));
+  const lp = simplexMax(positive, Array(game.length).fill(1), Array(game[0].length).fill(1));
+  const total = lp.solution.reduce((s, value) => s + value, 0);
+  if (!(total > SELECTION_RULES.lpTolerance)) throw new Error("Nash均衡の確率を正規化できません。");
+  return {strategy: lp.solution.map(value => value / total), pivots: lp.pivots};
+}
+
+/* 2人零和の有限ゲームを2本のLPで解き、双方の厳密な混合戦略を返す。 */
+function solveZeroSumGame(game) {
+  if (!Array.isArray(game) || !game.length || !Array.isArray(game[0]) || !game[0].length ||
+      game.some(row => !Array.isArray(row) || row.length !== game[0].length ||
+        row.some(value => !Number.isFinite(value))))
+    throw new Error("Nash均衡の利得行列が不正です。");
+  const m = game.length, n = game[0].length;
+  const columnSolution = exactColumnStrategy(game);
+  let ceiling = -Infinity;
+  for (const row of game) for (const value of row) ceiling = Math.max(ceiling, value);
+  ceiling += 1;
+  const complementTranspose = Array.from({length: n}, (_, j) =>
+    Array.from({length: m}, (_, i) => ceiling - game[i][j]));
+  const rowSolution = exactColumnStrategy(complementTranspose);
+  const row = rowSolution.strategy, col = columnSolution.strategy;
   const lowerByCol = Array.from({length: n}, (_, j) =>
     row.reduce((s, x, i) => s + x * game[i][j], 0));
   const upperByRow = Array.from({length: m}, (_, i) =>
     col.reduce((s, y, j) => s + y * game[i][j], 0));
   const lower = Math.min.apply(null, lowerByCol), upper = Math.max.apply(null, upperByRow);
   return {row: row, col: col, lower: lower, upper: upper,
-          value: (lower + upper) / 2, exploitability: upper - lower};
+          value: (lower + upper) / 2, exploitability: Math.max(0, upper - lower),
+          method: "linear-programming", pivots: rowSolution.pivots + columnSolution.pivots};
 }
 
-function selectionDecision(mode, members, opponents, matrix) {
-  const ownTrios = legalTrios(members), opponentTrios = legalTrios(opponents);
-  const profiles = ownTrios.map(trio => selectionProfile(matrix, trio));
-  const allColumns = opponents.map((f, i) => i);
-  const standard = profiles.map(p => profileMetrics(p, allColumns));
-  if (!profiles.length || !opponentTrios.length) return null;
+function selectionDecisionResult(model, mode, rows, extra) {
+  return Object.assign({mode: mode, rows: rows, best: rows[0].metrics,
+    ownTrios: model.ownTrios, opponentTrios: model.opponentTrios}, extra || {});
+}
 
-  if (mode === "standard") {
-    const rankedMetrics = standard.slice().sort(compareMetrics);
-    return {mode: mode, rows: rankedMetrics.map(m => ({trio: m.trio, value: m.score,
-      secondary: m.worst, metrics: m})), best: rankedMetrics[0], opponentTrios: opponentTrios};
-  }
+function standardSelectionDecision(model) {
+  const rows = model.getStandard().map((metrics, a) => ({a: a, trio: metrics.trio,
+    value: metrics.score, secondary: metrics.worst, metrics: metrics}))
+    .sort((x, y) => compareMetrics(x.metrics, y.metrics));
+  return selectionDecisionResult(model, "standard", rows);
+}
 
-  const game = selectionGameMatrix(profiles, opponentTrios);
-  if (mode === "maximin") {
-    const rows = game.map((values, a) => {
-      const value = Math.min.apply(null, values), worstIndex = values.indexOf(value);
-      return {a: a, trio: ownTrios[a], value: value, secondary: mean(values),
-              worstOpponent: opponentTrios[worstIndex], metrics: standard[a]};
-    }).sort((x, y) => (y.value - x.value) || (y.secondary - x.secondary) || compareMetrics(x.metrics, y.metrics));
-    return {mode: mode, rows: rows, best: rows[0].metrics, opponentTrios: opponentTrios, game: game};
-  }
-
-  if (mode === "nash") {
-    const equilibrium = solveZeroSumGame(game);
-    const rows = equilibrium.row.map((probability, a) => ({a: a, trio: ownTrios[a],
-      value: probability * 100, secondary: Math.min.apply(null, game[a]),
-      probability: probability, metrics: standard[a]}))
-      .sort((x, y) => (y.probability - x.probability) || (y.secondary - x.secondary));
-    return {mode: mode, rows: rows, best: rows[0].metrics, opponentTrios: opponentTrios,
-            game: game, equilibrium: equilibrium};
-  }
-
-  const prior = estimatedOpponentPrior(matrix, opponentTrios);
+function maximinSelectionDecision(model) {
+  const game = model.getGame(), standard = model.getStandard();
   const rows = game.map((values, a) => {
-    const expected = values.reduce((s, v, b) => s + v * prior.probabilities[b], 0);
-    const cvar = lowerTailCVaR(values, prior.probabilities, CVAR_ALPHA);
-    const value = (1 - CVAR_WEIGHT) * expected + CVAR_WEIGHT * cvar;
-    return {a: a, trio: ownTrios[a], value: value, secondary: cvar,
+    const value = Math.min.apply(null, values), worstIndex = values.indexOf(value);
+    return {a: a, trio: model.ownTrios[a], value: value, secondary: mean(values),
+            worstOpponent: model.opponentTrios[worstIndex], metrics: standard[a]};
+  }).sort((x, y) => (y.value - x.value) || (y.secondary - x.secondary) ||
+    compareMetrics(x.metrics, y.metrics));
+  return selectionDecisionResult(model, "maximin", rows, {game: game});
+}
+
+function nashSelectionDecision(model) {
+  const bayesian = model.getBayesianGame();
+  const game = bayesian.game, standard = model.getStandard();
+  const equilibrium = solveZeroSumGame(game);
+  const rows = equilibrium.row.map((probability, a) => ({a: a, trio: model.ownTrios[a],
+    value: probability * 100, secondary: Math.min.apply(null, game[a]),
+    probability: probability, metrics: standard[a]}))
+    .sort((x, y) => (y.probability - x.probability) || (y.secondary - x.secondary));
+  return selectionDecisionResult(model, "nash", rows, {game: game, equilibrium: equilibrium,
+    typeInfo: {typeAware: bayesian.typeAware, sampleCount: bayesian.sampleCount,
+      scenarioCount: bayesian.scenarios.length}});
+}
+
+function bayesSelectionDecision(model) {
+  const bayesian = model.getBayesianGame();
+  const game = bayesian.game, standard = model.getStandard();
+  const scenarioProbabilities = bayesian.scenarios.map(scenario => scenario.probability);
+  const prior = {probabilities: bayesian.selectionProbabilities, scores: bayesian.scores,
+    typeAware: bayesian.typeAware, sampleCount: bayesian.sampleCount,
+    scenarioCount: bayesian.scenarios.length};
+  const rows = model.ownTrios.map((trio, a) => {
+    const values = bayesian.scenarios.map(scenario => scenario.values[a]);
+    const expected = values.reduce((s, v, i) => s + v * scenarioProbabilities[i], 0);
+    const cvar = lowerTailCVaR(values, scenarioProbabilities, SELECTION_RULES.cvarAlpha);
+    const value = (1 - SELECTION_RULES.cvarWeight) * expected + SELECTION_RULES.cvarWeight * cvar;
+    return {a: a, trio: trio, value: value, secondary: cvar,
             expected: expected, cvar: cvar, metrics: standard[a]};
   }).sort((x, y) => (y.value - x.value) || (y.cvar - x.cvar) || (y.expected - x.expected));
-  return {mode: "bayes", rows: rows, best: rows[0].metrics, opponentTrios: opponentTrios,
-          game: game, prior: prior};
+  return selectionDecisionResult(model, "bayes", rows, {game: game, prior: prior});
+}
+
+const SELECTION_MODE_SOLVERS = Object.freeze({
+  standard: standardSelectionDecision,
+  maximin: maximinSelectionDecision,
+  nash: nashSelectionDecision,
+  bayes: bayesSelectionDecision,
+});
+
+function selectionDecision(mode, members, opponents, matrix, typeDistributions) {
+  const model = createSelectionModel(members, opponents, matrix, typeDistributions);
+  if (!model) return null;
+  const solver = SELECTION_MODE_SOLVERS[mode] || SELECTION_MODE_SOLVERS.standard;
+  return solver(model);
 }
 
 /* ---------------- パーティの強さ測定 ---------------- */
@@ -2881,7 +3162,7 @@ function aggregateTopBuildValues(builds, values) {
   const probabilities = topBuildProbabilities(builds);
   const rows = builds.map((build, i) => ({build:build, value:values[i], probability:probabilities[i]}));
   const expected = values.reduce((s, v, i) => s + v * probabilities[i], 0);
-  const cvar = lowerTailCVaR(values, probabilities, CVAR_ALPHA);
+  const cvar = lowerTailCVaR(values, probabilities, SELECTION_RULES.cvarAlpha);
   return {score:(1 - TOP_BUILD_RISK_WEIGHT) * expected + TOP_BUILD_RISK_WEIGHT * cvar,
           expected:expected, cvar:cvar, won:values.filter(v => v >= 50).length,
           rows:rows, probabilities:probabilities};
@@ -2980,7 +3261,7 @@ function hardestOpponentAnalysis(targets) {
         const cover = (ba + bb + bc) / 3;
         const worst = Math.min(ba, bb, bc);
         const solid = (p.avg[a] + p.avg[b] + p.avg[c]) / 3;
-        const score = SELECT_WEIGHT.cover * cover + SELECT_WEIGHT.worst * worst + SELECT_WEIGHT.solid * solid;
+        const score = selectionUtility(cover, worst, solid);
         if (score > replyScore || (score === replyScore &&
             (worst > replyWorst || (worst === replyWorst &&
               (cover > replyCover || (cover === replyCover && solid > replySolid)))))) {
@@ -3004,7 +3285,7 @@ function hardestOpponentAnalysis(targets) {
     const rs = matrix.map(row => row[j]);
     const cover = Math.max.apply(null, rs), avg = mean(rs);
     return {j: j, t: t, cover: cover, avg: avg,
-            score: (SELECT_WEIGHT.cover + SELECT_WEIGHT.worst) * cover + SELECT_WEIGHT.solid * avg};
+            score: selectionUtility(cover, cover, avg)};
   }).sort((x, y) => (x.score - y.score) || (x.cover - y.cover));
 
   const chosen = hardest ? hardest.columns.slice() : [];
@@ -3407,12 +3688,6 @@ function applyPlan(k) {
 }
 
 /* ---------------- 結果 ---------------- */
-function combos3(a) {
-  const r = [];
-  for (let i = 0; i < a.length; i++) for (let j = i + 1; j < a.length; j++)
-    for (let k = j + 1; k < a.length; k++) r.push([a[i], a[j], a[k]]);
-  return r;
-}
 function cellColor(v) {
   if (v >= 80) return ["#2f8f4e", "#fff"];
   if (v >= 65) return ["#8fd19e", "#14361f"];
@@ -3424,22 +3699,25 @@ function cellColor(v) {
 }
 
 function selectionPayoffMatrixHTML(decision) {
-  const game = decision.game, ownTrios = decision.rows
-    .slice().sort((x, y) => x.a - y.a).map(x => x.trio);
+  const game = decision.game, ownTrios = decision.ownTrios;
   const opponentTrios = decision.opponentTrios;
   let h = '<details style="margin-top:8px"><summary>選出利得行列 (' + game.length + '×' +
     opponentTrios.length + ')</summary>' +
-    '<p class="hint">行Aがこちら、列Bが相手の3体選出です。各セルはその組み合わせに対するU。' +
+    '<p class="hint">行Aがこちら、列Bが相手の3体選出です。各セルは隠れ型で条件付けしたUの事後平均。' +
     '6体から3体は最大20通りですが、メガ2体以上を含む選出は除外します。</p>' +
     '<div class="scroll"><table><tr><th class="rowh"></th>';
   opponentTrios.forEach((trio, b) => {
-    const probability = decision.prior ? '<br><span style="opacity:.7">' +
-      (decision.prior.probabilities[b] * 100).toFixed(1) + '%</span>' : '';
+    const p = decision.prior ? decision.prior.probabilities[b] :
+      (decision.equilibrium ? decision.equilibrium.col[b] : null);
+    const probability = p === null ? '' : '<br><span style="opacity:.7">' +
+      (p * 100).toFixed(1) + '%</span>';
     h += '<th>B' + (b + 1) + probability + '</th>';
   });
   h += '</tr>';
   game.forEach((values, a) => {
-    h += '<tr><td class="rowh">A' + (a + 1) + '</td>';
+    const probability = decision.equilibrium ? '<br><span style="opacity:.7">' +
+      (decision.equilibrium.row[a] * 100).toFixed(1) + '%</span>' : '';
+    h += '<tr><td class="rowh">A' + (a + 1) + probability + '</td>';
     values.forEach(v => {
       const c = cellColor(v);
       h += '<td style="background:' + c[0] + ';color:' + c[1] + '">' + v.toFixed(1) + '</td>';
@@ -3459,7 +3737,9 @@ function showResult() {
   const O = document.getElementById("out");
   const mode = currentCalcMode();
   const matrix = payoffMatrix(party, foes, rateSel);
-  const decision = selectionDecision(mode, party, foes, matrix);
+  const typeDistributions = (mode === "nash" || mode === "bayes") ?
+    hiddenOpponentTypeDistributions(party, foes) : null;
+  const decision = selectionDecision(mode, party, foes, matrix, typeDistributions);
   if (!decision) { O.innerHTML = '<div class="card"><p class="msg">メガ1体以下の3体組が作れません</p></div>'; return; }
   const rows = decision.rows, best = decision.best;
   const lead = best.trio.slice().sort((x, y) => {
@@ -3501,8 +3781,9 @@ function showResult() {
     oppMix.forEach(r => h += '<p class="kv">' + (r.probability * 100).toFixed(1) + '%　' +
       r.trio.map(i => esc(labelOfFoe(foes[i]))).join(' ＋ ') + '</p>');
     h += '<p class="hint">保証下限 ' + decision.equilibrium.lower.toFixed(2) +
-      ' / 上限 ' + decision.equilibrium.upper.toFixed(2) + ' / 近似誤差 ' +
-      decision.equilibrium.exploitability.toFixed(2) + '</p></div>';
+      ' / 上限 ' + decision.equilibrium.upper.toFixed(2) + ' / LP双対ギャップ ' +
+      decision.equilibrium.exploitability.toExponential(2) + ' / 型×選出 ' +
+      decision.typeInfo.scenarioCount + 'シナリオ</p></div>' + selectionPayoffMatrixHTML(decision);
   } else if (mode === "bayes") {
     const likely = decision.prior.probabilities.map((probability, b) => ({probability: probability, trio: decision.opponentTrios[b]}))
       .sort((x, y) => y.probability - x.probability).slice(0, 3);
@@ -3511,8 +3792,10 @@ function showResult() {
       '<p class="kv"><b>選出確率が高いと推定した相手</b></p>';
     likely.forEach(r => h += '<p class="kv">' + (r.probability * 100).toFixed(1) + '%　' +
       r.trio.map(i => esc(labelOfFoe(foes[i]))).join(' ＋ ') + '</p>');
-    h += '<p class="hint">実測の選出率がないため、一様事前分布に相手側の対面評価から得た' +
-      'softmax尤度を掛けて正規化したモデル推定確率です。</p></div>' + selectionPayoffMatrixHTML(decision);
+    h += '<p class="hint">実測の選出率がないため、採用率に従う相手6体の隠れ型を' +
+      decision.prior.sampleCount + '組標本化し、各型で相手側評価のsoftmax選出確率を求めています。' +
+      '型×選出 ' + decision.prior.scenarioCount + '共同シナリオのモデル推定です。</p></div>' +
+      selectionPayoffMatrixHTML(decision);
   }
   h += '<div style="margin-top:8px">';
   best.trio.forEach(i => {
@@ -3535,8 +3818,10 @@ function showResult() {
   h += '<div class="card"><h2>相手の型の想定</h2>';
   foes.forEach(f => {
     const vs = VAR.opponent(f.name, f.mega, f.megaSuffix), cov = vs[0].cover, unc = cov < 45;
-    const txt = vs.slice(0, 2).map(x => (x.w * 100).toFixed(0) + "% " + esc(x.build.item) + "・" +
-      STATK.filter(k => x.build.points[k]).map(k => k + x.build.points[k]).join(" ")).join(" / ");
+    const txt = vs.slice(0, 2).map(x => (x.w * 100).toFixed(1) + "% " +
+      esc(x.build.item + "・" + x.build.nature + "・" + x.build.ability + "・" +
+        STATK.filter(k => x.build.points[k]).map(k => k + x.build.points[k]).join(" ") + "・" +
+        x.build.moves.join("/"))).join(" / ");
     h += '<p class="kv"' + (unc ? ' style="color:var(--warn)"' : "") + ">" + (unc ? "※ " : "") +
       "<b>" + esc(labelOfFoe(f)) + "</b>: " + txt +
       ' <span style="opacity:.7">[' + vs.length + "型 / 配分カバー率 " + cov.toFixed(0) + "%]</span></p>";
